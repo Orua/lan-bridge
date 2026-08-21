@@ -3350,7 +3350,10 @@ def create_app(verbose: bool = False) -> FastAPI:
     app = FastAPI(
         title="LAN BRIDGE",
         version="0.1.0",
-        description="OpenAI Responses API → Chat Completions API 协议转换代理",
+        description=(
+            "Trusted-LAN OpenAI-compatible model bridge / "
+            "面向可信局域网的 OpenAI 兼容模型桥接、路由与协议转换网关"
+        ),
         lifespan=lifespan,
     )
 

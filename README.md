@@ -2,7 +2,53 @@
 
 ![LAN BRIDGE logo](desktop/assets/icon.png)
 
-LAN BRIDGE is a local OpenAI-compatible gateway with a Windows desktop manager. It translates OpenAI Responses API traffic to provider-compatible Chat Completions calls, while keeping provider credentials and runtime configuration on your own machine.
+LAN BRIDGE turns one computer into an OpenAI-compatible bridge for trusted
+clients on the same local network. Clients use one LAN address and a stable set
+of model aliases; the bridge selects the configured upstream provider,
+translates protocols and tool calls when required, forwards the request with
+the provider credential stored on the bridge host, and streams the normalized
+response back to the client.
+
+## What LAN BRIDGE does
+
+Run LAN BRIDGE on a computer that can reach your upstream model services, then
+point Codex CLI, Codex Desktop, VS Code extensions, or another OpenAI-compatible
+client at that computer. Multiple trusted devices on the LAN can share the same
+bridge endpoint and routing configuration without copying every provider key to
+every client.
+
+```text
+Codex / VS Code / other OpenAI-compatible clients
+                         │
+                         │  LAN: http://<bridge-ip>:8765/v1
+                         ▼
+                    LAN BRIDGE
+       model alias → provider routing → protocol/tool/stream conversion
+                         │
+                         ▼
+       Qwen / DeepSeek / Kimi / GLM / Doubao / OpenAI-compatible APIs
+```
+
+The bridge accepts OpenAI-style Responses, Chat Completions, model-list, and
+image-generation requests. Depending on the selected model route, it either
+passes a native Responses request to a compatible upstream or converts it to a
+provider-compatible Chat Completions flow, then converts the result back into
+the response shape expected by the client. Streaming, tool calls, conversation
+continuations, vision, image generation, and optional Web Search are handled by
+the same routing layer.
+
+## 软件作用
+
+LAN BRIDGE 用一台能够访问上游模型服务的电脑，在可信局域网内建立统一的 OpenAI 兼容
+桥接入口。Codex CLI、Codex Desktop、VS Code 插件以及其他 OpenAI 兼容客户端只需连接
+这台电脑的局域网地址，并使用统一的模型别名；桥接器会选择对应的上游提供商，按需转换
+Responses 与 Chat Completions 协议、工具调用和流式事件，使用保存在桥接主机上的提供商
+凭据转发请求，再把规范化后的结果流式返回客户端。
+
+这样，多台可信设备可以共用一个局域网入口、一套模型路由和上游配置，不需要在每台客户
+端分别保存全部提供商密钥。它同时处理连续会话、工具调用、视觉输入、图片生成及可选的
+Web Search；对于支持原生 Responses API 的上游可直接转发，对于只支持 Chat
+Completions 的上游则执行双向协议转换。
 
 > [!IMPORTANT]
 > LAN BRIDGE is an independently maintained derivative of
@@ -71,7 +117,17 @@ LAN BRIDGE 是基于上游项目
 
 ## Security model
 
-This repository contains no production API keys or personal runtime configuration. Do not commit `.lan-bridge.yaml`, `.lan-bridge.env`, `.env`, logs, captures, or exported credentials. Keep the server bound to `127.0.0.1` unless you understand the network exposure and have enabled appropriate access controls.
+This repository contains no production API keys or personal runtime
+configuration. Do not commit `.lan-bridge.yaml`, `.lan-bridge.env`, `.env`,
+logs, captures, or exported credentials.
+
+The server defaults to `127.0.0.1`, which is reachable only from the bridge
+host. LAN access requires explicitly binding to `0.0.0.0` or to a LAN interface
+address. The management API remains loopback-only, but the public `/v1/*`
+model endpoints do not add a separate inbound shared-key authentication layer.
+Expose them only to a trusted LAN and restrict access with the host firewall,
+a VPN, or an authenticated reverse proxy. Never expose an unauthenticated
+bridge directly to the public Internet.
 
 ## Requirements
 
@@ -92,6 +148,37 @@ lan-bridge start
 ```
 
 The default endpoint is `http://127.0.0.1:8765/v1`. The default configuration file is `%USERPROFILE%\.lan-bridge.yaml`. You can start from [config.example.yaml](config.example.yaml) and set credentials through environment variables instead of writing keys into YAML.
+
+### Enable trusted LAN access / 开启可信局域网访问
+
+The default `127.0.0.1` binding is local-only. To let other trusted devices on
+the same LAN use the bridge, set the listening host in `.lan-bridge.yaml`:
+
+默认的 `127.0.0.1` 只能由桥接主机本机访问。要让同一局域网中的其他可信设备使用，
+请在 `.lan-bridge.yaml` 中修改监听地址：
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8765
+```
+
+Restart LAN BRIDGE after changing the listening address. On another device,
+replace `<bridge-ip>` with the bridge computer's LAN IP, for example:
+
+修改监听地址后需要重启 LAN BRIDGE。其他设备应把 `<bridge-ip>` 替换为桥接主机的
+局域网 IP，例如：
+
+```text
+Base URL: http://192.168.1.20:8765/v1
+```
+
+Allow TCP port `8765` only from the trusted LAN or selected client addresses in
+the host firewall. A narrower alternative is to bind directly to the bridge
+computer's LAN IP instead of `0.0.0.0`.
+
+请在主机防火墙中只允许可信局域网或指定客户端访问 TCP `8765` 端口。相比
+`0.0.0.0`，也可以直接绑定桥接主机的局域网 IP，以缩小监听范围。
 
 ## Desktop development
 
@@ -120,9 +207,13 @@ Use these client values after LAN BRIDGE is running:
 
 ```text
 Base URL: http://127.0.0.1:8765/v1
-API key: any non-empty value unless LAN BRIDGE API filtering is enabled
+API key: any non-empty placeholder for custom-provider routes; upstream provider keys stay on the bridge host
 Model: one of the aliases configured in .lan-bridge.yaml
 ```
+
+For a client on another trusted LAN device, use
+`http://<bridge-ip>:8765/v1` instead. The client-side placeholder key is not an
+inbound access-control mechanism.
 
 The desktop Settings page can update the local YAML, import/export redacted configuration, and switch Codex between LAN BRIDGE and official OpenAI routing.
 

@@ -98,7 +98,7 @@ const zh = {
 
   'about.title': '关于',
   'about.version': '版本',
-  'about.desc': 'LAN BRIDGE 是一个本地代理工具，将 OpenAI Responses API 转换为 Chat Completions API，让 Codex CLI 和桌面端可以使用国内大模型。',
+  'about.desc': 'LAN BRIDGE 在可信局域网内建立统一的 OpenAI 兼容桥接入口，按模型路由并转换协议，将 Codex、VS Code 和其他兼容客户端的请求转发到配置的上游模型。',
   'about.features': '核心功能',
   'about.f1Title': '协议转换',
   'about.f1Desc': 'Responses API 与 Chat Completions API 双向转换，支持流式和非流式输出。',
@@ -223,7 +223,7 @@ const en: Record<TransKey, string> = {
 
   'about.title': 'About',
   'about.version': 'Version',
-  'about.desc': 'LAN BRIDGE is a local proxy that converts OpenAI Responses API to Chat Completions API, enabling Codex CLI and desktop to use Chinese LLMs.',
+  'about.desc': 'LAN BRIDGE provides one OpenAI-compatible endpoint for trusted LAN clients, routes each model, translates protocols when needed, and forwards Codex, VS Code, and other compatible clients to configured upstream models.',
   'about.features': 'Features',
   'about.f1Title': 'Protocol Translation',
   'about.f1Desc': 'Bidirectional Responses API and Chat Completions API conversion with streaming support.',

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lan-bridge"
 version = "0.1.0"
-description = "LAN BRIDGE local gateway for OpenAI-compatible model providers"
+description = "Trusted-LAN OpenAI-compatible bridge and upstream model router"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"

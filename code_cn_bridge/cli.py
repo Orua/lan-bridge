@@ -11,10 +11,10 @@ import click
 @click.group()
 @click.version_option(version="0.1.0", prog_name="lan-bridge")
 def main():
-    """LAN BRIDGE - 本地模型网关
+    """LAN BRIDGE - 可信局域网模型桥接网关
 
-    将 OpenAI Responses API 转换为 Chat Completions API，
-    使 code CLI 无缝接入通义千问、DeepSeek、Kimi 等模型。
+    为局域网客户端提供统一的 OpenAI 兼容入口，按模型路由并转换协议，
+    将 Codex、VS Code 等客户端请求转发到配置的上游模型服务。
     """
 
 
