@@ -1,0 +1,56 @@
+# Python caches and packaging outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+dist-backend/
+node_modules/
+desktop/dist/
+desktop/dist-electron/
+desktop/release/
+
+# Local logs and backups
+*.log
+*.bak
+*.bak[0-9]*
+.bak/
+agent/backups/
+agent/temp/
+agent/output/
+.codex-remote-attachments/
+.workbuddy/
+
+# Generated media and runtime captures
+generated_image_*
+*.sse
+*.jsonl
+*.bundle
+*.zip
+*.rar
+*.7z
+*.exe
+*.blockmap
+
+# Local configuration and secrets
+.env
+.env.*
+config.yaml
+*.local.yaml
+.lan-bridge.yaml
+.lan-bridge.env
+*.pem
+*.p12
+*.key
+credentials*.json
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

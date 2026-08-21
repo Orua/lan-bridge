@@ -1,0 +1,46 @@
+appId: com.lan-bridge.app
+productName: LAN BRIDGE
+copyright: MIT
+
+directories:
+  output: ../../../lan_bridge_release
+  buildResources: assets
+
+beforePack: scripts/verify-backend.cjs
+afterPack: scripts/verify-backend.cjs
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+
+extraResources:
+  - from: ../dist-backend/
+    to: backend/
+  - from: assets/
+    to: assets/
+
+mac:
+  target:
+    - dmg
+  icon: assets/icon.icns
+
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: assets/icon.png
+  category: Utility
+  maintainer: Orua
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: LAN BRIDGE
+
+win:
+  target:
+    - nsis
+    - portable
+  icon: assets/icon.ico
+  signExecutable: false

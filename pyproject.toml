@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lan-bridge"
+version = "0.1.0"
+description = "LAN BRIDGE local gateway for OpenAI-compatible model providers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "pydantic>=2.0",
+    "watchfiles>=0.21.0",
+    "zstandard>=0.23.0",
+]
+
+[project.scripts]
+lan-bridge = "code_cn_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["code_cn_bridge*"]
