@@ -34,6 +34,32 @@ These changes make the projects behaviorally different. Upstream issues and
 support requests should be reproduced against upstream before being reported
 there; LAN BRIDGE-specific issues belong in this repository.
 
+## 中文说明：与上游版本的关系和差异
+
+LAN BRIDGE 是基于上游项目
+[git-liu835/codex-cn-bridge](https://github.com/git-liu835/codex-cn-bridge)
+修改形成的独立维护版本，上游项目原名为 `code CN Bridge`。本项目不是上游官方发布版，
+上游作者不负责 LAN BRIDGE 的修改内容、构建产物、技术支持或安全决策。
+
+本公开仓库是从经过大量修改的本地工作区重新建立，并使用了压缩后的全新 Git 历史，
+因此 GitHub 页面不会自动显示“Forked from”标记。新历史没有保留当时所基于的精确上游
+提交号；以下内容是以当前可核验的上游 v0.3.22 与 LAN BRIDGE 首个公开版本为参照整理的
+主要差异。
+
+| 对比范围 | LAN BRIDGE 相对上游的主要变化 |
+| --- | --- |
+| 品牌与本地状态 | 将公开产品名、CLI 命令、应用标识、可执行文件、配置文件、环境变量前缀、用户数据目录和界面链接由 `code CN Bridge` 统一调整为 `LAN BRIDGE`。 |
+| Responses 兼容性 | 扩展 Responses API 转换、连续会话、工具调用规范化、流式恢复、WebSocket、图片与视觉流程、Web Search 多轮调用、上下文压缩及 Codex 客户端用量统计。 |
+| 路由机制 | 增加严格的逐模型提供商路由，将原生 Responses 与 Chat 兼容路径分开，加入自定义提供商槽位、回退控制、代理支持和可配置上下文上限。 |
+| 提供商与桌面控制 | 增加 OpenAI 兼容适配器，并扩展模型能力、原生/自定义路由、搜索、配置导入导出和诊断等桌面管理功能。 |
+| 安全与隐私 | 使用脱敏示例配置，将真实凭据保留在 Git 之外；配置导出会移除敏感信息，同时排除公司内部路径、专用测试数据，并默认只监听本机回环地址。 |
+| 稳定性与测试 | 增加连接复用、有容量上限的日志与统计、生命周期恢复、打包后端校验、CI，以及更完整的 Python/Electron 回归测试。 |
+| 发布范围 | 当前维护重点是 Windows 安装版和便携版，并统一应用与托盘图标；上游的自动更新及 macOS/Linux 发布流程不属于 LAN BRIDGE 当前支持的发布范围。 |
+
+两个项目现在的行为和发布方式已经明显不同。只有能在上游原版中复现的问题才适合提交给
+上游；LAN BRIDGE 特有的问题应在本仓库反馈。更完整的来源与署名信息见
+[NOTICE.md](NOTICE.md)。
+
 ## Features
 
 - OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and image-generation endpoints.
