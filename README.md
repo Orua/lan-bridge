@@ -4,6 +4,36 @@
 
 LAN BRIDGE is a local OpenAI-compatible gateway with a Windows desktop manager. It translates OpenAI Responses API traffic to provider-compatible Chat Completions calls, while keeping provider credentials and runtime configuration on your own machine.
 
+> [!IMPORTANT]
+> LAN BRIDGE is an independently maintained derivative of
+> [git-liu835/codex-cn-bridge](https://github.com/git-liu835/codex-cn-bridge),
+> formerly named `code CN Bridge`. It is not an official upstream release and
+> is not maintained or supported by the upstream author. This repository was
+> created from a substantially modified working tree with a new, squashed Git
+> history, so GitHub does not display it as a platform-level fork. See
+> [NOTICE.md](NOTICE.md) for attribution and provenance details.
+
+## Differences from upstream
+
+The exact upstream base commit was not preserved when this public repository
+was created. The comparison below describes the material differences verified
+against upstream `git-liu835/codex-cn-bridge` v0.3.22 and this repository's
+initial public release.
+
+| Area | LAN BRIDGE changes |
+| --- | --- |
+| Identity and local state | Renamed the public product, CLI command, application identifiers, executable, configuration file, environment-variable prefix, user-data directory, and UI links from `code CN Bridge` to `LAN BRIDGE`. |
+| Responses compatibility | Extends Responses API translation, continuation handling, tool-call normalization, streaming recovery, WebSocket handling, image/vision flows, Web Search rounds, context compaction, and usage reporting for Codex-style clients. |
+| Routing | Adds strict per-model provider routing, separate native Responses and Chat-compatible paths, custom provider slots, fallback controls, proxy support, and configurable context limits. |
+| Providers and desktop controls | Adds an OpenAI-compatible adapter and expanded dashboard controls for model capabilities, native/custom routing, search, configuration import/export, and diagnostics. |
+| Security and privacy | Uses a redacted example configuration, keeps live credentials outside Git, removes secrets from configuration exports, avoids shipping company-specific paths and test data, and defaults to loopback-only binding. |
+| Reliability and tests | Adds connection reuse, bounded logging and statistics, lifecycle recovery, packaged-backend verification, CI, and a substantially expanded Python/Electron regression suite. |
+| Packaging scope | Focuses the maintained release flow on Windows installer/portable builds with one unified application/tray icon. Upstream auto-update and macOS/Linux release paths are not carried as supported LAN BRIDGE release flows. |
+
+These changes make the projects behaviorally different. Upstream issues and
+support requests should be reproduced against upstream before being reported
+there; LAN BRIDGE-specific issues belong in this repository.
+
 ## Features
 
 - OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and image-generation endpoints.
@@ -90,4 +120,6 @@ npm run test:electron
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md). Upstream attribution is
+retained because substantial portions of this project are derived from
+`git-liu835/codex-cn-bridge`.
