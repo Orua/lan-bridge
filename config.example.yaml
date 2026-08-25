@@ -6,6 +6,19 @@ server:
   codex_official_proxy_url: ""
   native_codex_base_url: https://chatgpt.com/backend-api/codex
   native_stream_timeout: 600
+  # Disabled by default. When enabled, LAN BRIDGE reads the bridge host's
+  # file-based Codex login; clients authenticate with a managed bridge key.
+  native_auth_injection:
+    enabled: false
+    auth_file: "" # auto-detect %CODEX_HOME%/auth.json or %USERPROFILE%/.codex/auth.json
+
+# The bridge issues and stores hashes of client access keys in a separate local
+# file. The raw key is shown only once when it is created or rotated in the
+# desktop manager. With no enabled key, /v1 fails closed while the loopback-only
+# management UI remains available to create the first key. Do not put keys here.
+access_control:
+  enabled: true
+  # store_path: "" # optional; default: %USERPROFILE%/.lan-bridge/access-keys.json
 
 providers:
   qwen:

@@ -64,6 +64,7 @@ class StabilityUpgradeTests(unittest.TestCase):
             config_path.write_text(
                 yaml.safe_dump({
                     "providers": {"deepseek": {"api_key": "LIVE_SECRET", "base_url": "https://example.invalid"}},
+                    "access_control": {"enabled": True, "keys": [{"key_hash": "BRIDGE_SECRET"}]},
                     "model_mapping": {},
                 }),
                 encoding="utf-8",
@@ -78,6 +79,8 @@ class StabilityUpgradeTests(unittest.TestCase):
             backup_text = backups[0].read_text(encoding="utf-8")
             self.assertNotIn("LIVE_SECRET", backup_text)
             self.assertNotIn("api_key:", backup_text)
+            self.assertNotIn("BRIDGE_SECRET", backup_text)
+            self.assertNotIn("keys:", backup_text)
             self.assertIn("base_url", backup_text)
             self.assertIn("LIVE_SECRET", config_path.read_text(encoding="utf-8"))
 

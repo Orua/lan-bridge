@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -39,6 +39,8 @@ class RequestLog:
     input_tools: str = ""
     chat_tools: str = ""
     first_response_ms: float | None = None
+    access_key_id: str = ""
+    access_key_prefix: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +60,8 @@ class RequestLog:
             "input_tools": self.input_tools,
             "chat_tools": self.chat_tools,
             "first_response_ms": round(self.first_response_ms, 1) if self.first_response_ms is not None else None,
+            "access_key_id": self.access_key_id,
+            "access_key_prefix": self.access_key_prefix,
         }
 
 
@@ -91,6 +95,8 @@ class UsageStore:
             "ts": log.timestamp,
             "time": datetime.fromtimestamp(log.timestamp).isoformat(timespec="seconds"),
             "client_ip": log.client_ip or "unknown",
+            "access_key_id": log.access_key_id,
+            "access_key_prefix": log.access_key_prefix,
             "endpoint": log.endpoint,
             "model": log.model,
             "provider": log.provider,
@@ -153,6 +159,14 @@ class UsageStore:
         ip_totals = by_ip.setdefault(ip, self._empty_counter())
         self._increment_counter(totals, log)
         self._increment_counter(ip_totals, log)
+        if log.access_key_id:
+            by_key = data.setdefault("by_key", {})
+            key_totals = by_key.setdefault(log.access_key_id, self._empty_counter())
+            key_totals["prefix"] = log.access_key_prefix
+            key_totals["last_used_at"] = datetime.fromtimestamp(
+                log.timestamp, timezone.utc
+            ).isoformat(timespec="seconds")
+            self._increment_counter(key_totals, log)
         self._write_json_atomic(path, data)
 
     @staticmethod
@@ -164,6 +178,7 @@ class UsageStore:
             "updated_at": "",
             "totals": self._empty_counter(),
             "by_ip": {},
+            "by_key": {},
         }
         if day:
             data["date"] = day
@@ -176,7 +191,7 @@ class UsageStore:
             counter["success"] = int(counter.get("success", 0)) + 1
         else:
             counter["errors"] = int(counter.get("errors", 0)) + 1
-        counter["tokens"] = int(counter.get("tokens", 0)) + int(log.tokens or 0)
+        counter["tokens"] = int(counter.get("tokens", 0)) + max(int(log.tokens or 0), 0)
 
     @staticmethod
     def _read_json(path: Path, default: dict) -> dict:

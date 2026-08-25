@@ -143,6 +143,44 @@ class StatsCollectorTests(unittest.TestCase):
             self.assertEqual(len(access_log.read_text(encoding="utf-8").splitlines()), 2)
             self.assertEqual(stats.get_recent_logs(1)[0]["client_ip"], "10.0.0.3")
 
+    def test_persists_usage_by_access_key_without_plaintext_secret(self):
+        with TemporaryDirectory() as tmp:
+            stats = StatsCollector(usage_dir=tmp)
+            stats.record(RequestLog(
+                1,
+                "gpt-5.6-sol",
+                "responses",
+                200,
+                100,
+                tokens=17,
+                client_ip="10.0.0.2",
+                access_key_id="key-a",
+                access_key_prefix="lbk_example",
+            ))
+            stats.record(RequestLog(
+                2,
+                "deepseek-v4-pro",
+                "responses",
+                500,
+                100,
+                tokens=3,
+                client_ip="10.0.0.2",
+                access_key_id="key-a",
+                access_key_prefix="lbk_example",
+            ))
+
+            usage = stats.get_usage_summary()
+            key_usage = usage["by_key"]["key-a"]
+            access_log = (Path(tmp) / "access-1970-01-01.jsonl").read_text(encoding="utf-8")
+
+            self.assertEqual(key_usage["requests"], 2)
+            self.assertEqual(key_usage["success"], 1)
+            self.assertEqual(key_usage["errors"], 1)
+            self.assertEqual(key_usage["tokens"], 20)
+            self.assertEqual(key_usage["prefix"], "lbk_example")
+            self.assertIn("last_used_at", key_usage)
+            self.assertNotIn("Bearer", access_log)
+
     def test_access_logs_rotate_at_bounded_size(self):
         with TemporaryDirectory() as tmp, patch(
             "code_cn_bridge.stats._ACCESS_LOG_MAX_BYTES", 350

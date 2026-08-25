@@ -57,6 +57,7 @@ class CodexSwitchTests(unittest.TestCase):
     def _config(self, proxy_url=""):
         return SimpleNamespace(
             _data={"server": {"codex_official_proxy_url": proxy_url}, "model_slots": {}},
+            _config_path=None,
             server_host="127.0.0.1",
             server_port=8765,
             model_mapping={},
@@ -716,6 +717,68 @@ class CodexSwitchTests(unittest.TestCase):
         self.assertEqual(response["active_provider"], "bocha")
         self.assertTrue(response["providers"]["bocha"]["api_key_set"])
         self.assertNotIn("api_key", response["providers"]["bocha"])
+
+    def test_settings_exposes_native_login_status_without_client_secret_fields(self):
+        config = self._config()
+        config._data["server"]["native_auth_injection"] = {
+            "enabled": True,
+            "auth_file": "C:/test/auth.json",
+        }
+        config.data = config._data
+        with patch.object(admin_api, "get_config", return_value=config):
+            response = asyncio.run(admin_api.get_settings())
+
+        native_auth = response["server"]["native_auth_injection"]
+        self.assertTrue(native_auth["enabled"])
+        self.assertIn("auth_file_found", native_auth)
+        self.assertNotIn("client_token", native_auth)
+        self.assertNotIn("client_token_set", native_auth)
+
+    def test_settings_update_saves_only_native_login_injection_fields(self):
+        config = self._config()
+        config.save = Mock()
+        config._data["access_control"] = {"enabled": True}
+        config._data["server"]["native_auth_injection"] = {
+            "enabled": False,
+        }
+        config.data = config._data
+        key_store = Mock()
+        key_store.list_records.return_value = [{"enabled": True}]
+        with patch.object(admin_api, "get_config", return_value=config), patch.object(
+            admin_api, "get_access_key_store", return_value=key_store
+        ):
+            asyncio.run(admin_api.update_settings({
+                "native_auth_injection": {
+                    "enabled": True,
+                    "auth_file": "C:/test/auth.json",
+                },
+            }))
+
+        stored = config._data["server"]["native_auth_injection"]
+        self.assertTrue(stored["enabled"])
+        self.assertEqual(stored["auth_file"], "C:/test/auth.json")
+        self.assertNotIn("client_token", stored)
+        config.save.assert_called_once()
+
+    def test_config_export_does_not_embed_access_key_records(self):
+        config = self._config()
+        config._data["server"]["native_auth_injection"] = {
+            "enabled": True,
+            "auth_file": "C:/test/auth.json",
+        }
+        config._data["access_control"] = {
+            "enabled": True,
+            "store_path": "C:/test/access-keys.json",
+            "keys": [{"id": "key-a", "key_hash": "not-for-export"}],
+        }
+        with patch.object(admin_api, "get_config", return_value=config):
+            response = asyncio.run(admin_api.export_config())
+
+        self.assertIn("native_auth_injection", response["yaml"])
+        self.assertIn("auth_file", response["yaml"])
+        self.assertIn("store_path", response["yaml"])
+        self.assertNotIn("not-for-export", response["yaml"])
+        self.assertNotIn("key_hash", response["yaml"])
 
     def test_web_search_update_preserves_key_when_form_leaves_it_blank(self):
         config = self._config()

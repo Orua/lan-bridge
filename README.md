@@ -111,7 +111,8 @@ LAN BRIDGE 是基于上游项目
 - OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and image-generation endpoints.
 - Model aliases and provider routing for Qwen, DeepSeek, Kimi, GLM, Doubao, OpenAI-compatible services, and custom slots.
 - Streaming translation, tool-call handling, usage statistics, request logs, and configuration hot reload.
-- Optional native Codex routing, Web Search integration, and model context-window controls.
+- Optional native Codex routing, host-side Codex login injection for the same user on a trusted LAN, Web Search integration, and model context-window controls.
+- Managed bridge access keys with per-key model allowlists and lightweight token-usage accounting.
 - Electron desktop manager with dashboard, provider/model configuration, logs, themes, language settings, tray operation, and launch-at-login support.
 - Credentials are read from local YAML or environment variables and are removed from configuration exports.
 
@@ -123,11 +124,15 @@ logs, captures, or exported credentials.
 
 The server defaults to `127.0.0.1`, which is reachable only from the bridge
 host. LAN access requires explicitly binding to `0.0.0.0` or to a LAN interface
-address. The management API remains loopback-only, but the public `/v1/*`
-model endpoints do not add a separate inbound shared-key authentication layer.
-Expose them only to a trusted LAN and restrict access with the host firewall,
-a VPN, or an authenticated reverse proxy. Never expose an unauthenticated
-bridge directly to the public Internet.
+address. The management API remains loopback-only. When `access_control.enabled`
+is true, every `/v1/*` HTTP or WebSocket request must carry a bridge-issued
+bearer key, and the requested model must be in that key's allowlist. Key
+verifiers are stored as hashes in a separate local access-key store (not in
+exportable YAML); the raw value is displayed only once at creation or rotation.
+Keep the bridge on a trusted LAN or VPN, restrict the port with the host
+firewall, and never publish it directly to the Internet. Plain HTTP protects
+neither prompts nor keys from a hostile LAN; use an isolated network, SSH
+tunnel, or TLS where appropriate.
 
 ## Requirements
 
@@ -203,19 +208,95 @@ The backend is written to `dist-backend/`. Electron Builder produces the install
 
 ## Configure Codex or another OpenAI-compatible client
 
-Use these client values after LAN BRIDGE is running:
+Clients do not copy the bridge host's OpenAI login state or provider API keys.
+They send one LAN BRIDGE access key, while the bridge chooses the upstream route
+from the requested model name and keeps provider credentials on the bridge host.
+Use these values after LAN BRIDGE is running:
 
 ```text
 Base URL: http://127.0.0.1:8765/v1
-API key: any non-empty placeholder for custom-provider routes; upstream provider keys stay on the bridge host
-Model: one of the aliases configured in .lan-bridge.yaml
+API key: a LAN BRIDGE access key created in the desktop Access Keys page
+Model: one of the aliases allowed for that key
 ```
 
 For a client on another trusted LAN device, use
-`http://<bridge-ip>:8765/v1` instead. The client-side placeholder key is not an
-inbound access-control mechanism.
+`http://<bridge-ip>:8765/v1` instead. Access control defaults to fail closed:
+until the loopback-only desktop manager creates the first key, `/v1/*` returns
+a configuration error rather than accepting unauthenticated traffic.
 
 The desktop Settings page can update the local YAML, import/export redacted configuration, and switch Codex between LAN BRIDGE and official OpenAI routing.
+
+### Official Codex custom provider
+
+Codex can use the bridge as a custom Responses provider. The following is a
+minimal example; keep the access key in the environment rather than in a
+committed config file:
+
+```toml
+model_provider = "lan_bridge"
+
+[model_providers.lan_bridge]
+name = "LAN BRIDGE"
+base_url = "http://192.168.1.20:8765/v1"
+wire_api = "responses"
+env_key = "LAN_BRIDGE_API_KEY"
+requires_openai_auth = false
+```
+
+Set `LAN_BRIDGE_API_KEY` on the client to the key issued by LAN BRIDGE. Select
+the desired route by model name. For example, the configured native aliases
+`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` use the bridge host's native
+Codex route; configured DeepSeek, Qwen, and Grok aliases continue to use their
+existing provider adapters. The bridge does not forward a client OpenAI login
+state.
+
+### Host Codex login injection (same-user trusted LAN)
+
+This optional mode lets a second computer call official Codex Responses models
+without copying the bridge computer's OpenAI login cache. It is intended only
+for one person's trusted devices. It is not an account-sharing, multi-user, or
+public gateway feature, and it does not turn a ChatGPT subscription into an API
+key.
+
+On the bridge computer:
+
+1. Sign in to Codex with ChatGPT and use file-based credential storage
+   (`cli_auth_credentials_store = "file"`). LAN BRIDGE auto-detects
+   `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`.
+2. Create an access key in **Access Keys**, restrict it to the native model
+   aliases that it should use, and enable **Host Codex Login Injection**.
+3. Bind only to the required LAN interface and firewall the port to the selected
+   client computer.
+
+On the client computer, keep the OpenAI login out of the configuration and use
+the bridge access key as the custom provider key:
+
+```toml
+model_provider = "lan_bridge"
+
+[model_providers.lan_bridge]
+name = "LAN BRIDGE"
+base_url = "http://192.168.1.20:8765/v1"
+env_key = "LAN_BRIDGE_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+Set `LAN_BRIDGE_API_KEY` locally to the bridge-only key. LAN BRIDGE validates it,
+removes it before forwarding, then loads `access_token` and `account_id` from
+the bridge host's Codex cache. Client-supplied OpenAI auth and account headers
+are never used as the bridge credential. LAN BRIDGE does not implement its own
+OAuth refresh endpoint; Codex refreshes its cache during normal use. If the
+cached access token expires, use Codex on the bridge computer or sign in again.
+
+### Access keys and usage
+
+The desktop **Access Keys** page creates, disables, rotates, and deletes bridge
+keys, and assigns each key an explicit list of model aliases (or all configured
+models). The raw key is shown exactly once after creation or rotation, so copy
+it to the client environment immediately. The bridge records a small local
+summary of request count and input/output/total tokens per key; it does not
+store prompts or upstream login tokens in that summary.
 
 ## Tests
 

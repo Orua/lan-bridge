@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import contextmanager
 from contextvars import ContextVar
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -11,9 +12,19 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from .models import build_error_response
+from .access_control import (
+    ANONYMOUS_PRINCIPAL,
+    BridgeAccessError,
+    BridgePrincipal,
+    authenticate_bridge_headers,
+)
 
 logger = logging.getLogger("lan-bridge")
 _current_client_ip: ContextVar[str] = ContextVar("lan_bridge_client_ip", default="")
+_current_bridge_principal: ContextVar[BridgePrincipal] = ContextVar(
+    "lan_bridge_principal",
+    default=ANONYMOUS_PRINCIPAL,
+)
 
 
 def client_ip_from_request(request: Request) -> str:
@@ -24,6 +35,20 @@ def client_ip_from_request(request: Request) -> str:
 
 def current_client_ip() -> str:
     return _current_client_ip.get() or "unknown"
+
+
+def current_bridge_principal() -> BridgePrincipal:
+    return _current_bridge_principal.get()
+
+
+@contextmanager
+def bridge_principal_context(principal: BridgePrincipal):
+    """Bind an explicitly captured principal while a streaming body is consumed."""
+    token = _current_bridge_principal.set(principal)
+    try:
+        yield
+    finally:
+        _current_bridge_principal.reset(token)
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
@@ -62,6 +87,37 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             elapsed,
         )
         return response
+
+
+class BridgeAccessMiddleware(BaseHTTPMiddleware):
+    """Authenticate every OpenAI-compatible endpoint with a managed bridge key."""
+
+    async def dispatch(self, request: Request, call_next):
+        if request.method != "OPTIONS" and request.url.path.startswith("/v1/"):
+            from .config import get_config
+
+            try:
+                principal = authenticate_bridge_headers(request.headers, get_config())
+            except BridgeAccessError as exc:
+                status_code = exc.status_code
+                error_type = (
+                    "bridge_configuration_error"
+                    if status_code == 503
+                    else "bridge_auth_error"
+                )
+                headers = {"WWW-Authenticate": "Bearer"} if status_code == 401 else None
+                return JSONResponse(
+                    content=build_error_response(str(exc), error_type, status_code),
+                    status_code=status_code,
+                    headers=headers,
+                )
+            request.state.bridge_principal = principal
+            token = _current_bridge_principal.set(principal)
+            try:
+                return await call_next(request)
+            finally:
+                _current_bridge_principal.reset(token)
+        return await call_next(request)
 
 
 class ApiKeyFilter(logging.Filter):

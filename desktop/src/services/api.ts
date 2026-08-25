@@ -1,4 +1,4 @@
-import type { ProxyStatus, ModelConfig, SlotConfig, ServerSettings, RequestLogEntry, TestResult, CodexConfigStatus, WebSearchSettings, WebSearchTestResult } from '../types';
+import type { ProxyStatus, ModelConfig, SlotConfig, ServerSettings, RequestLogEntry, TestResult, CodexConfigStatus, WebSearchSettings, WebSearchTestResult, AccessKeysResponse, AccessKeySecretResponse, AccessKeyRecord } from '../types';
 
 const BASE = 'http://127.0.0.1:8765';
 
@@ -89,4 +89,25 @@ export const api = {
     request<{ status: string; slot_id: string }>('/admin/api/slots/' + slotId, { method: 'PUT', body: JSON.stringify(data) }),
   testSlot: (slotId: string, data?: Record<string, string>) =>
     request<TestResult>('/admin/api/slots/' + slotId + '/test', { method: 'POST', body: JSON.stringify(data || {}) }),
+
+  // Client access keys. Full secrets are returned only by create/rotate.
+  getAccessKeys: () => request<AccessKeysResponse>('/admin/api/access-keys'),
+  createAccessKey: (data: { name: string; allowed_models: string[] }) =>
+    request<AccessKeySecretResponse>('/admin/api/access-keys', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateAccessKey: (id: string, data: { name: string; allowed_models: string[]; enabled: boolean }) =>
+    request<AccessKeyRecord>(`/admin/api/access-keys/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  rotateAccessKey: (id: string) =>
+    request<AccessKeySecretResponse>(`/admin/api/access-keys/${encodeURIComponent(id)}/rotate`, {
+      method: 'POST',
+    }),
+  deleteAccessKey: (id: string) =>
+    request<{ status: string }>(`/admin/api/access-keys/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
 };

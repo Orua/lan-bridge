@@ -5,6 +5,8 @@ import Models from './pages/Models';
 import Settings from './pages/Settings';
 import Logs from './pages/Logs';
 import About from './pages/About';
+import AccessKeys from './pages/AccessKeys';
+import appIcon from '../assets/icon.png';
 import StatusBar from './components/StatusBar';
 import { api } from './services/api';
 import { t, Lang } from './i18n';
@@ -82,7 +84,7 @@ const AppInner: React.FC<{ proxyRunning: boolean; requestCount: number }> = ({ p
     <div className="app-shell">
       <header className="app-header">
         <div className="header-brand">
-          <span className="header-logo">&#9653;</span>
+          <img className="header-logo" src={appIcon} alt="" />
           <span className="header-title">{tl('app.title')}</span>
         </div>
         <div className="header-status">
@@ -99,6 +101,9 @@ const AppInner: React.FC<{ proxyRunning: boolean; requestCount: number }> = ({ p
           <NavLink to="/models" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <span className="nav-icon">&#9881;</span> {tl('nav.models')}
           </NavLink>
+          <NavLink to="/access-keys" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
+            <span className="nav-icon">&#128273;</span> {tl('nav.accessKeys')}
+          </NavLink>
           <NavLink to="/settings" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`}>
             <span className="nav-icon">&#9776;</span> {tl('nav.settings')}
           </NavLink>
@@ -114,6 +119,7 @@ const AppInner: React.FC<{ proxyRunning: boolean; requestCount: number }> = ({ p
           <Routes>
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/models" element={<Models />} />
+            <Route path="/access-keys" element={<AccessKeys />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/logs" element={<Logs />} />
             <Route path="/about" element={<About />} />

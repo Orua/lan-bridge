@@ -20,6 +20,7 @@ from code_cn_bridge.native_proxy import (
     _native_client,
     custom_model_info,
     custom_model_context_settings,
+    fetch_merged_models,
     merge_model_catalog,
     native_request_headers,
     normalize_native_payload,
@@ -33,12 +34,20 @@ from code_cn_bridge.provider_proxy import (
     proxy_provider_responses,
 )
 from code_cn_bridge.routing import resolve_route
+from code_cn_bridge.codex_auth import NativeCredentials
+from code_cn_bridge.access_control import ANONYMOUS_PRINCIPAL
 from code_cn_bridge import server
 
 
 class FakeConfig:
     def __init__(self):
-        self._data = {"server": {}}
+        self._data = {
+            "access_control": {"enabled": False},
+            "server": {
+                "native_codex_base_url": "https://chatgpt.com/backend-api/codex",
+                "native_auth_injection": {"enabled": True},
+            },
+        }
         self.providers = {
             "deepseek": {
                 "adapter": "deepseek",
@@ -78,6 +87,24 @@ class FakeConfig:
 
 
 class UnifiedRoutingTests(unittest.TestCase):
+    def setUp(self):
+        credentials = NativeCredentials(
+            access_token="HOST_OPENAI_OAUTH",
+            account_id="account-host",
+        )
+        native_credentials = patch(
+            "code_cn_bridge.native_proxy.load_native_credentials",
+            return_value=credentials,
+        )
+        native_credentials.start()
+        self.addCleanup(native_credentials.stop)
+        bridge_auth = patch(
+            "code_cn_bridge.middleware.authenticate_bridge_headers",
+            return_value=ANONYMOUS_PRINCIPAL,
+        )
+        bridge_auth.start()
+        self.addCleanup(bridge_auth.stop)
+
     def test_explicit_custom_mapping_wins_over_gpt_prefix(self):
         cfg = FakeConfig()
         cfg.model_mapping["gpt-custom"] = {
@@ -92,23 +119,25 @@ class UnifiedRoutingTests(unittest.TestCase):
         self.assertEqual(route.kind, "custom")
         self.assertEqual(route.provider, "deepseek")
 
-    def test_native_route_uses_passthrough_auth(self):
+    def test_native_route_is_selected_by_exact_model_alias(self):
         route = resolve_route(FakeConfig(), "gpt-5.6-sol")
 
         self.assertEqual(route.kind, "native_codex")
-        self.assertEqual(route.auth_mode, "passthrough")
+        self.assertEqual(route.auth_mode, "host_login")
 
-    def test_native_header_allowlist_excludes_unrelated_client_headers(self):
+    def test_native_header_allowlist_injects_host_credentials(self):
+        config = FakeConfig()
         headers = native_request_headers({
-            "authorization": "Bearer OPENAI_OAUTH",
-            "chatgpt-account-id": "account-1",
+            "authorization": "Bearer LAN_BRIDGE_KEY",
+            "chatgpt-account-id": "account-client",
             "x-oai-attestation": "attestation",
             "cookie": "must-not-forward",
             "x-random-secret": "must-not-forward",
-        })
+        }, config)
 
-        self.assertEqual(headers["authorization"], "Bearer OPENAI_OAUTH")
-        self.assertEqual(headers["chatgpt-account-id"], "account-1")
+        self.assertEqual(headers["authorization"], "Bearer HOST_OPENAI_OAUTH")
+        self.assertEqual(headers["chatgpt-account-id"], "account-host")
+        self.assertNotIn("x-oai-attestation", headers)
         self.assertNotIn("cookie", headers)
         self.assertNotIn("x-random-secret", headers)
 
@@ -143,6 +172,32 @@ class UnifiedRoutingTests(unittest.TestCase):
         kwargs = client_class.call_args.kwargs
         self.assertFalse(kwargs["trust_env"])
         self.assertNotIn("proxy", kwargs)
+
+    def test_models_proxy_supplies_default_client_version(self):
+        observed: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            observed["client_version"] = request.url.params.get("client_version", "")
+            return httpx.Response(200, json={"models": []})
+
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/models",
+            "raw_path": b"/v1/models",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 8765),
+        })
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with patch("code_cn_bridge.native_proxy._native_client", return_value=client):
+            response = asyncio.run(fetch_merged_models(request, FakeConfig()))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(observed["client_version"], "0.0.0")
 
     def test_native_payload_drops_non_native_encrypted_content_and_previous_id(self):
         payload = normalize_native_payload({
@@ -628,12 +683,17 @@ class UnifiedRoutingTests(unittest.TestCase):
         ):
             response = TestClient(server.create_app()).post(
                 "/v1/responses",
-                json={"model": "gpt-5.6-sol", "input": [], "stream": False},
+                json={"model": "gpt-5.6-sol", "input": "hello", "stream": False},
                 headers={"authorization": "Bearer OPENAI_OAUTH"},
             )
 
         self.assertEqual(response.status_code, 200)
         proxy.assert_awaited_once()
+        self.assertEqual(proxy.await_args.args[1]["input"], [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }])
         route_vision.assert_not_called()
 
     def test_deepseek_responses_endpoint_bypasses_chat_translation(self):

@@ -1,6 +1,6 @@
 {
   "name": "lan-bridge-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "LAN BRIDGE Desktop - 可信局域网 OpenAI 兼容模型桥接与上游路由管理工具",
   "author": "Orua",
   "homepage": "https://github.com/Orua/lan-bridge",

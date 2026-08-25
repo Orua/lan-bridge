@@ -17,6 +17,11 @@ from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
 from .http_utils import make_native_async_client
+from .codex_auth import (
+    NativeAuthError,
+    load_native_credentials,
+    native_auth_injection_enabled,
+)
 
 
 DEFAULT_NATIVE_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -33,7 +38,7 @@ _NATIVE_CONTEXT_CACHE_MAX_BYTES = 96 * 1024 * 1024
 _NATIVE_CONTEXT_CACHE_TTL_SECONDS = 2 * 60 * 60
 _NATIVE_CONTEXT_CACHE: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 _NATIVE_CONTEXT_CACHE_BYTES = 0
-_RESPONSE_CONTEXT_OWNERS: dict[str, str] = {}
+_RESPONSE_CONTEXT_OWNERS: dict[str, tuple[str, str]] = {}
 FORWARD_REQUEST_HEADERS = frozenset({
     "authorization",
     "chatgpt-account-id",
@@ -65,6 +70,18 @@ HOP_BY_HOP_HEADERS = frozenset({
     "upgrade",
 })
 
+SAFE_RESPONSE_HEADERS = frozenset({
+    "cache-control",
+    "content-type",
+    "openai-processing-ms",
+    "openai-version",
+    "request-id",
+    "retry-after",
+    "x-accel-buffering",
+    "x-envoy-upstream-service-time",
+    "x-request-id",
+})
+
 
 class NativeUpstreamHTTPError(RuntimeError):
     """A non-success response from the official Codex upstream."""
@@ -81,6 +98,17 @@ class NativeUpstreamHTTPError(RuntimeError):
         self.status_code = status_code
 
 
+class ResponseContextAccessError(RuntimeError):
+    """A continuation cannot access a cache entry owned by this bridge key."""
+
+    code = "response_context_unavailable"
+
+    def __init__(self):
+        super().__init__(
+            "previous_response_id is unavailable for this bridge access key"
+        )
+
+
 def _usage_trace_fields(response: dict[str, Any]) -> dict[str, Any]:
     """Extract upstream-reported usage without modifying the proxied response."""
     usage = response.get("usage")
@@ -95,7 +123,7 @@ def _usage_trace_fields(response: dict[str, Any]) -> dict[str, Any]:
     return {"usage": usage, "tokens": total}
 
 
-def native_request_headers(headers) -> dict[str, str]:
+def native_request_headers(headers, config=None) -> dict[str, str]:
     forwarded = {
         "content-type": "application/json",
         "accept": "text/event-stream, application/json",
@@ -105,6 +133,24 @@ def native_request_headers(headers) -> dict[str, str]:
         value = headers.get(name)
         if value is not None:
             forwarded[name] = value
+    if config is not None:
+        if not native_auth_injection_enabled(config):
+            raise NativeAuthError(
+                "Host Codex login injection is disabled; enable it on the bridge computer"
+            )
+        if not _is_official_openai_url(_native_base_url(config)):
+            raise NativeAuthError(
+                "Host login injection is restricted to official OpenAI and ChatGPT upstreams"
+            )
+        credentials = load_native_credentials(config)
+        # The client Authorization value is a LAN BRIDGE key.  It and all
+        # client-supplied account/attestation credentials must never leave the
+        # bridge process.
+        forwarded.pop("authorization", None)
+        forwarded.pop("chatgpt-account-id", None)
+        forwarded.pop("x-oai-attestation", None)
+        forwarded["authorization"] = f"Bearer {credentials.access_token}"
+        forwarded["chatgpt-account-id"] = credentials.account_id
     return forwarded
 
 
@@ -243,24 +289,67 @@ def _repair_orphan_tool_outputs(input_items: list[Any]) -> list[Any]:
     return repaired
 
 
-def _native_context_get(response_id: str) -> list[Any] | None:
+def _discard_native_context(response_id: str) -> None:
     global _NATIVE_CONTEXT_CACHE_BYTES
     cached = _NATIVE_CONTEXT_CACHE.pop(response_id, None)
+    _RESPONSE_CONTEXT_OWNERS.pop(response_id, None)
+    if cached is not None:
+        _NATIVE_CONTEXT_CACHE_BYTES -= len(cached[1])
+
+
+def _native_context_owner(
+    response_id: str | None,
+    access_key_id: str = "",
+) -> tuple[str, str] | None:
+    if response_id is None:
+        return None
+    if not isinstance(response_id, str) or not response_id:
+        if access_key_id:
+            raise ResponseContextAccessError()
+        return None
+    cached = _NATIVE_CONTEXT_CACHE.get(response_id)
     if cached is None:
-        _RESPONSE_CONTEXT_OWNERS.pop(response_id, None)
+        if access_key_id:
+            raise ResponseContextAccessError()
         return None
-    created_at, encoded = cached
+    created_at, _ = cached
     if time.monotonic() - created_at > _NATIVE_CONTEXT_CACHE_TTL_SECONDS:
-        _NATIVE_CONTEXT_CACHE_BYTES -= len(encoded)
-        _RESPONSE_CONTEXT_OWNERS.pop(response_id, None)
+        _discard_native_context(response_id)
+        if access_key_id:
+            raise ResponseContextAccessError()
         return None
+    owner = _RESPONSE_CONTEXT_OWNERS.get(response_id)
+    # Tolerate cache state created by an older in-process implementation only
+    # for legacy callers that do not provide an access-key identity.
+    if isinstance(owner, str):
+        owner = (owner, "")
+    if not isinstance(owner, tuple) or len(owner) != 2:
+        if access_key_id:
+            raise ResponseContextAccessError()
+        return None
+    if access_key_id and owner[1] != access_key_id:
+        raise ResponseContextAccessError()
+    return owner
+
+
+def _native_context_get(
+    response_id: Any,
+    access_key_id: str = "",
+) -> list[Any] | None:
+    _native_context_owner(response_id, access_key_id)
+    if not isinstance(response_id, str) or not response_id:
+        return None
+    cached = _NATIVE_CONTEXT_CACHE.pop(response_id, None)
+    if cached is None:
+        return None
+    _, encoded = cached
     _NATIVE_CONTEXT_CACHE[response_id] = cached
     try:
         value = json.loads(encoded)
     except (TypeError, ValueError):
-        _NATIVE_CONTEXT_CACHE.pop(response_id, None)
-        _NATIVE_CONTEXT_CACHE_BYTES -= len(encoded)
-        _RESPONSE_CONTEXT_OWNERS.pop(response_id, None)
+        _discard_native_context(response_id)
+        if access_key_id:
+            raise ResponseContextAccessError()
         return None
     return value if isinstance(value, list) else None
 
@@ -271,6 +360,7 @@ def _native_context_put(
     output_items: list[Any],
     *,
     owner: str = "native_codex",
+    access_key_id: str = "",
 ) -> None:
     global _NATIVE_CONTEXT_CACHE_BYTES
     if not response_id:
@@ -286,7 +376,7 @@ def _native_context_put(
     if previous is not None:
         _NATIVE_CONTEXT_CACHE_BYTES -= len(previous[1])
     _NATIVE_CONTEXT_CACHE[response_id] = (time.monotonic(), encoded)
-    _RESPONSE_CONTEXT_OWNERS[response_id] = owner
+    _RESPONSE_CONTEXT_OWNERS[response_id] = (owner, access_key_id)
     _NATIVE_CONTEXT_CACHE_BYTES += len(encoded)
     while (
         len(_NATIVE_CONTEXT_CACHE) > _NATIVE_CONTEXT_CACHE_MAX_ENTRIES
@@ -297,11 +387,13 @@ def _native_context_put(
         _NATIVE_CONTEXT_CACHE_BYTES -= len(removed)
 
 
-def cached_response_owner(response_id: str | None) -> str | None:
+def cached_response_owner(
+    response_id: str | None,
+    access_key_id: str = "",
+) -> str | None:
     """Return the upstream that created a cached response ID."""
-    if not isinstance(response_id, str) or response_id not in _NATIVE_CONTEXT_CACHE:
-        return None
-    return _RESPONSE_CONTEXT_OWNERS.get(response_id)
+    owner = _native_context_owner(response_id, access_key_id)
+    return owner[0] if owner is not None else None
 
 
 def prepare_provider_responses_payload(
@@ -310,16 +402,17 @@ def prepare_provider_responses_payload(
     provider: str,
     *,
     supports_previous_response_id: bool = False,
+    access_key_id: str = "",
 ) -> tuple[dict[str, Any], bool]:
     """Keep native Responses state unless a turn crosses provider boundaries."""
     normalized = copy.deepcopy(body)
     normalized["model"] = target_model
     previous_id = normalized.get("previous_response_id")
-    owner = cached_response_owner(previous_id)
+    owner = cached_response_owner(previous_id, access_key_id)
     if owner is None or (owner == provider and supports_previous_response_id):
         return normalized, False
 
-    prior_input = _native_context_get(previous_id)
+    prior_input = _native_context_get(previous_id, access_key_id)
     current_input = normalized.get("input")
     normalized.pop("previous_response_id", None)
     if prior_input is not None and isinstance(current_input, list):
@@ -330,16 +423,21 @@ def prepare_provider_responses_payload(
 def prepare_chat_responses_payload(
     body: dict[str, Any],
     target_model: str,
+    *,
+    access_key_id: str = "",
 ) -> tuple[dict[str, Any], bool]:
     """Expand a Codex Responses continuation for a stateless Chat upstream."""
     normalized = copy.deepcopy(body)
     normalized["model"] = target_model
     previous_id = normalized.pop("previous_response_id", None)
+    prior_input = (
+        _native_context_get(previous_id, access_key_id)
+        if previous_id is not None
+        else None
+    )
     current_input = normalized.get("input")
     if not isinstance(current_input, list):
         return normalized, False
-
-    prior_input = _native_context_get(previous_id) if isinstance(previous_id, str) else None
     normalized["input"] = _repair_orphan_tool_outputs([
         *(prior_input or []),
         *current_input,
@@ -347,7 +445,11 @@ def prepare_chat_responses_payload(
     return normalized, prior_input is not None
 
 
-def _prepare_native_responses_payload(body: dict[str, Any], target_model: str) -> dict[str, Any]:
+def _prepare_native_responses_payload(
+    body: dict[str, Any],
+    target_model: str,
+    access_key_id: str = "",
+) -> dict[str, Any]:
     """Replay cached native output when Codex sends only a continuation delta."""
     normalized = normalize_native_payload(
         body,
@@ -355,10 +457,14 @@ def _prepare_native_responses_payload(body: dict[str, Any], target_model: str) -
         preserve_previous_response_id=True,
     )
     previous_id = normalized.pop("previous_response_id", None)
+    prior_input = (
+        _native_context_get(previous_id, access_key_id)
+        if previous_id is not None
+        else None
+    )
     current_input = normalized.get("input")
     if not isinstance(current_input, list):
         return normalized
-    prior_input = _native_context_get(previous_id) if isinstance(previous_id, str) else None
     normalized["input"] = _repair_orphan_tool_outputs([
         *(prior_input or []),
         *current_input,
@@ -395,7 +501,7 @@ def _response_headers(headers: httpx.Headers) -> dict[str, str]:
     return {
         name: value
         for name, value in headers.items()
-        if name.lower() not in HOP_BY_HOP_HEADERS and name.lower() != "content-length"
+        if name.lower() in SAFE_RESPONSE_HEADERS
     }
 
 
@@ -426,15 +532,17 @@ async def proxy_native_responses(
     *,
     upstream_path: str = "responses",
     on_trace: Callable[[str, dict[str, Any]], None] | None = None,
+    access_key_id: str = "",
 ) -> Response:
     """Forward a Responses request and stream upstream bytes without SSE reconstruction."""
     if upstream_path not in {"responses", "responses/compact"}:
         raise ValueError(f"Unsupported native Responses path: {upstream_path}")
     server = getattr(config, "data", {}).get("server", {})
     timeout_seconds = float(server.get("native_stream_timeout", 600))
-    client = _native_client(config, httpx.Timeout(timeout_seconds, connect=15.0))
 
     if upstream_path == "responses/compact":
+        if body.get("previous_response_id") is not None and access_key_id:
+            cached_response_owner(body.get("previous_response_id"), access_key_id)
         upstream_payload = normalize_native_payload(
             body,
             target_model,
@@ -442,11 +550,17 @@ async def proxy_native_responses(
         )
     else:
         continuation_id = body.get("previous_response_id")
+        upstream_payload = _prepare_native_responses_payload(
+            body,
+            target_model,
+            access_key_id,
+        )
         context_cache_hit = (
             isinstance(continuation_id, str)
-            and continuation_id in _NATIVE_CONTEXT_CACHE
+            and cached_response_owner(continuation_id, access_key_id) is not None
         )
-        upstream_payload = _prepare_native_responses_payload(body, target_model)
+
+    client = _native_client(config, httpx.Timeout(timeout_seconds, connect=15.0))
 
     if on_trace is not None:
         prepared_input = upstream_payload.get("input", [])
@@ -464,7 +578,7 @@ async def proxy_native_responses(
         return client.build_request(
             "POST",
             f"{_native_base_url(config)}/{upstream_path}",
-            headers=native_request_headers(request.headers),
+            headers=native_request_headers(request.headers, config),
             content=json.dumps(
                 upstream_payload,
                 ensure_ascii=False,
@@ -563,6 +677,7 @@ async def proxy_native_responses(
                                 response_id,
                                 upstream_payload.get("input", []),
                                 output_items,
+                                access_key_id=access_key_id,
                             )
                 yield chunk
         finally:
@@ -596,6 +711,7 @@ async def proxy_native_responses(
                     payload["id"],
                     upstream_payload.get("input", []),
                     payload["output"],
+                    access_key_id=access_key_id,
                 )
             if isinstance(payload, dict) and on_trace is not None:
                 on_trace("completed", _usage_trace_fields(payload))
@@ -792,6 +908,30 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
         for model in native_models
         if isinstance(model, dict) and model.get("slug")
     }
+    native_template = next(iter(by_slug.values()), None)
+    for alias, entry in getattr(config, "native_models", {}).items():
+        if isinstance(entry, dict) and not entry.get("enabled", True):
+            continue
+        alias = str(alias)
+        if not alias or alias in by_slug:
+            continue
+        target = str(entry.get("target") or alias) if isinstance(entry, dict) else alias
+        template = by_slug.get(target) or native_template
+        if template is not None:
+            model = copy.deepcopy(template)
+            model["slug"] = alias
+            model["display_name"] = str(entry.get("display_name") or alias) if isinstance(entry, dict) else alias
+            model["description"] = str(entry.get("description") or "Routed through LAN BRIDGE host login") if isinstance(entry, dict) else "Routed through LAN BRIDGE host login"
+            model["priority"] = int(entry.get("priority") or 90) if isinstance(entry, dict) else 90
+        else:
+            model = custom_model_info(alias, {
+                "display_name": str(entry.get("display_name") or alias) if isinstance(entry, dict) else alias,
+                "description": str(entry.get("description") or "Routed through LAN BRIDGE host login") if isinstance(entry, dict) else "Routed through LAN BRIDGE host login",
+                "context_window": int(entry.get("context_window") or 200_000) if isinstance(entry, dict) else 200_000,
+                "is_reasoning_text": True,
+                "priority": int(entry.get("priority") or 90) if isinstance(entry, dict) else 90,
+            }, None)
+        by_slug[alias] = model
     for alias, entry in getattr(config, "model_mapping", {}).items():
         if not isinstance(entry, dict) or not entry.get("enabled", True):
             continue
@@ -810,12 +950,19 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
 
 async def fetch_merged_models(request: Request, config) -> Response:
     client = _native_client(config, httpx.Timeout(10.0, connect=5.0))
-    query = request.url.query
     url = f"{_native_base_url(config)}/models"
-    if query:
-        url = f"{url}?{query}"
+    query = list(request.query_params.multi_items())
+    if not any(name == "client_version" for name, _ in query):
+        # The native catalog requires this Codex-specific query field, while
+        # ordinary OpenAI-compatible clients correctly call /v1/models without
+        # it.  Supplying a neutral value keeps both client styles compatible.
+        query.append(("client_version", "0.0.0"))
     try:
-        upstream = await client.get(url, headers=native_request_headers(request.headers))
+        upstream = await client.get(
+            url,
+            params=query,
+            headers=native_request_headers(request.headers, config),
+        )
         if upstream.is_success:
             native_payload = upstream.json()
             merged = merge_model_catalog(native_payload, config)

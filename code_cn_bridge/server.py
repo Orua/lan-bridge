@@ -18,7 +18,8 @@ import threading
 import time
 import uuid
 import zlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from datetime import date
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from .client import UpstreamClient, close_upstream_clients, get_upstream_client
 from .http_utils import make_async_client
 from .native_proxy import (
     NativeUpstreamHTTPError,
+    ResponseContextAccessError,
     _native_context_put,
     fetch_merged_models,
     prepare_chat_responses_payload,
@@ -56,8 +58,18 @@ from .routing import resolve_route
 from .middleware import (
     ErrorHandlingMiddleware,
     RequestLoggingMiddleware,
+    BridgeAccessMiddleware,
     ApiKeyFilter,
+    bridge_principal_context,
+    current_bridge_principal,
     current_client_ip,
+)
+from .access_control import (
+    ANONYMOUS_PRINCIPAL,
+    BridgeAccessError,
+    BridgePrincipal,
+    authenticate_bridge_headers,
+    require_model_access,
 )
 from .models import build_error_response, build_responses_response, make_message_output_item, make_responses_usage, make_web_search_call_output_item, _uid
 from .stats import get_stats, RequestLog
@@ -65,8 +77,96 @@ from .admin_api import _refresh_codex_model_catalog_if_active, _require_local_ad
 from .web_search import WebSearchError, search_web
 
 logger = logging.getLogger("lan-bridge")
+_suppress_request_stats: ContextVar[bool] = ContextVar(
+    "lan_bridge_suppress_request_stats",
+    default=False,
+)
+
+
+@contextmanager
+def _suppressed_request_stats():
+    token = _suppress_request_stats.set(True)
+    try:
+        yield
+    finally:
+        _suppress_request_stats.reset(token)
+
+
+def _request_bridge_principal(request: Request) -> BridgePrincipal:
+    principal = getattr(request.state, "bridge_principal", None)
+    return principal if isinstance(principal, BridgePrincipal) else current_bridge_principal()
+
+
+def _model_access_response(principal: BridgePrincipal, model: str) -> JSONResponse | None:
+    try:
+        require_model_access(principal, model)
+    except BridgeAccessError as exc:
+        return JSONResponse(
+            content=build_error_response(str(exc), "bridge_model_permission_error", exc.status_code),
+            status_code=exc.status_code,
+        )
+    return None
+
+
+def _bind_stream_principal(response, principal: BridgePrincipal):
+    """Keep per-key accounting bound after BaseHTTPMiddleware has unwound."""
+    if not isinstance(response, StreamingResponse):
+        return response
+    original_iterator = response.body_iterator
+
+    async def body_iterator():
+        with bridge_principal_context(principal):
+            async for chunk in original_iterator:
+                yield chunk
+
+    response.body_iterator = body_iterator()
+    return response
+
+
+def _configured_model_dependency_aliases(cfg, model: str, body: dict, endpoint: str) -> list[str]:
+    """Return user-facing aliases that an allowed model may delegate to."""
+    dependencies: list[str] = []
+    entry = cfg.model_mapping.get(model)
+    entry = entry if isinstance(entry, dict) else {}
+
+    input_items = body.get("input", [])
+    has_images = (
+        _chat_has_images(body)
+        if endpoint == "chat"
+        else _current_turn_has_images(input_items if isinstance(input_items, list) else [])
+    )
+    if has_images and not entry.get("is_multimodal"):
+        vision_alias = str(entry.get("vision_alias") or "").strip()
+        if not vision_alias:
+            try:
+                vision_alias = str(cfg.slot_alias("vision") or "").strip()
+            except (KeyError, TypeError, AttributeError):
+                vision_alias = ""
+        if vision_alias and vision_alias != model and vision_alias in cfg.model_mapping:
+            dependencies.append(vision_alias)
+
+    tools = body.get("tools") or []
+    image_tool_requested = any(
+        isinstance(tool, dict) and tool.get("type") in ("image_gen", "image_generation")
+        for tool in tools
+    ) or _has_explicit_image_tool_choice(body)
+    if endpoint == "responses" and not image_tool_requested:
+        image_tool_requested = _looks_like_image_generation_request(
+            _latest_user_text(input_items if isinstance(input_items, list) else [])
+        )
+    if image_tool_requested and not entry.get("is_image_gen"):
+        image_alias = str(entry.get("image_gen_alias") or "").strip()
+        if not image_alias:
+            try:
+                image_alias = str(cfg.slot_alias("image_gen") or "").strip()
+            except (KeyError, TypeError, AttributeError):
+                image_alias = ""
+        if image_alias and image_alias != model and image_alias in cfg.model_mapping:
+            dependencies.append(image_alias)
+    return list(dict.fromkeys(dependencies))
 
 _SENSITIVE_KEYS = {"api_key", "authorization", "token", "access_token", "refresh_token", "key"}
+_BRIDGE_SECRET_RE = re.compile(r"\blbk_[A-Za-z0-9_-]{40,}\b")
 _MIN_VISION_IMAGE_DIMENSION = 14
 _IMAGE_GEN_RETRY_CACHE_TTL = 60.0
 _IMAGE_GEN_RETRY_CACHE_MAX = 16
@@ -132,8 +232,10 @@ def _redact_for_audit(value, depth: int = 0):
         if len(value) > 40:
             return [_redact_for_audit(item, depth + 1) for item in value[:40]] + [f"...[{len(value) - 40} more]"]
         return [_redact_for_audit(item, depth + 1) for item in value]
-    if isinstance(value, str) and len(value) > 4000:
-        return value[:4000] + "...[truncated]"
+    if isinstance(value, str):
+        value = _BRIDGE_SECRET_RE.sub("lbk_***", value)
+        if len(value) > 4000:
+            return value[:4000] + "...[truncated]"
     return value
 
 
@@ -1370,7 +1472,7 @@ def _redact_debug_text(text: str) -> str:
         r"(?im)^(authorization|x-api-key|api-key|cookie|set-cookie):\s*.*$",
         r'(?i)("(?:api[_-]?key|apiKey|x-api-key|authorization|token|accessToken|refreshToken|cookie)"\s*:\s*")[^"]*(")',
     )
-    redacted = text
+    redacted = _BRIDGE_SECRET_RE.sub("lbk_***", text)
     for pattern in patterns:
         redacted = re.sub(pattern, lambda m: f"{m.group(1)}: ***" if len(m.groups()) == 1 else f"{m.group(1)}***{m.group(2)}", redacted)
     return redacted
@@ -3349,7 +3451,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     app = FastAPI(
         title="LAN BRIDGE",
-        version="0.1.0",
+        version="0.2.0",
         description=(
             "Trusted-LAN OpenAI-compatible model bridge / "
             "面向可信局域网的 OpenAI 兼容模型桥接、路由与协议转换网关"
@@ -3359,6 +3461,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     app.add_middleware(ErrorHandlingMiddleware)
     app.add_middleware(RequestLoggingMiddleware)
+    app.add_middleware(BridgeAccessMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "app://."],
@@ -3378,13 +3481,27 @@ def create_app(verbose: bool = False) -> FastAPI:
         cfg = get_config()
         return {
             "status": "ok",
-            "adapters": reg.list(),
-            "model_mapping": cfg.model_mapping,
+            "version": "0.2.0",
+            "adapters": len(reg.list()),
         }
 
     @app.get("/v1/models")
     async def list_models(request: Request):
-        return await fetch_merged_models(request, get_config())
+        principal = _request_bridge_principal(request)
+        response = await fetch_merged_models(request, get_config())
+        if response.status_code != 200 or "*" in principal.allowed_models:
+            return response
+        try:
+            payload = json.loads(response.body)
+        except (TypeError, ValueError):
+            return response
+        if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+            payload["models"] = [
+                model for model in payload["models"]
+                if isinstance(model, dict)
+                and principal.can_use_model(str(model.get("slug") or model.get("id") or ""))
+            ]
+        return JSONResponse(content=payload, status_code=200)
 
     @app.post("/admin/reload-config")
     async def admin_reload(request: Request):
@@ -3410,6 +3527,11 @@ def create_app(verbose: bool = False) -> FastAPI:
             )
 
         model = body.get("model", "unknown")
+        principal = _request_bridge_principal(request)
+        denied = _model_access_response(principal, model)
+        if denied is not None:
+            _record_request(start_time, model, "responses/compact", 403, False, "model permission denied")
+            return denied
         route = resolve_route(cfg, model)
         if route.kind != "native_codex":
             original_input = copy.deepcopy(body.get("input", []) or [])
@@ -3432,17 +3554,24 @@ def create_app(verbose: bool = False) -> FastAPI:
                     base_url="http://bridge.internal",
                     timeout=600,
                 ) as client:
-                    compact_response = await client.post("/v1/responses", json=compact_body)
+                    with _suppressed_request_stats():
+                        compact_response = await client.post(
+                            "/v1/responses",
+                            json=compact_body,
+                            headers={"Authorization": request.headers.get("authorization", "")},
+                        )
                 if compact_response.status_code >= 400:
                     return JSONResponse(
                         content=compact_response.json(),
                         status_code=compact_response.status_code,
                     )
-                summary = _responses_output_text(compact_response.json())
+                compact_payload = compact_response.json()
+                summary = _responses_output_text(compact_payload)
                 if not summary:
                     raise ValueError("第三方模型未返回可用的会话摘要")
                 _record_request(
                     start_time, model, "responses/compact", 200, False, "",
+                    tokens=int((compact_payload.get("usage") or {}).get("total_tokens") or 0),
                     provider=route.provider, target_model=route.target_model,
                 )
                 return JSONResponse(content={
@@ -3464,13 +3593,23 @@ def create_app(verbose: bool = False) -> FastAPI:
                 route.target_model,
                 cfg,
                 upstream_path="responses/compact",
+                access_key_id=principal.key_id,
             )
             _record_request(
                 start_time, model, "responses/compact", response.status_code,
                 bool(body.get("stream")), "", provider="native_codex",
                 target_model=route.target_model,
             )
-            return response
+            return _bind_stream_principal(response, principal)
+        except ResponseContextAccessError as exc:
+            _record_request(
+                start_time, model, "responses/compact", 409, False, str(exc),
+                provider="native_codex", target_model=route.target_model,
+            )
+            return JSONResponse(
+                content=build_error_response(str(exc), exc.code, 409),
+                status_code=409,
+            )
         except NativeUpstreamHTTPError as exc:
             message = str(exc)
             _record_request(
@@ -3510,6 +3649,19 @@ def create_app(verbose: bool = False) -> FastAPI:
 
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
+        principal = _request_bridge_principal(request)
+        denied = _model_access_response(principal, model)
+        if denied is not None:
+            _record_request(start_time, model, "responses", 403, bool(stream), "model permission denied")
+            return denied
+        for dependency in _configured_model_dependency_aliases(cfg, model, body, "responses"):
+            denied = _model_access_response(principal, dependency)
+            if denied is not None:
+                _record_request(
+                    start_time, model, "responses", 403, bool(stream),
+                    "dependent model permission denied",
+                )
+                return denied
         # Streaming work runs after BaseHTTPMiddleware's context has unwound.
         # Read the ASGI connection directly while the endpoint still owns it.
         request_client_ip = (
@@ -3519,6 +3671,12 @@ def create_app(verbose: bool = False) -> FastAPI:
         provider_name = route.provider
         target_model = route.target_model
         if route.kind == "native_codex":
+            if isinstance(body.get("input"), str):
+                body["input"] = [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": body["input"]}],
+                }]
             try:
                 native_tokens = 0
                 native_finished = False
@@ -3581,6 +3739,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                     body,
                     target_model,
                     cfg,
+                    access_key_id=principal.key_id,
                     on_trace=trace_native,
                 )
                 if not isinstance(response, StreamingResponse):
@@ -3588,7 +3747,16 @@ def create_app(verbose: bool = False) -> FastAPI:
                         start_time, model, "responses", response.status_code, False, "", native_tokens,
                         provider="native_codex", target_model=target_model, client_ip=request_client_ip,
                     )
-                return response
+                return _bind_stream_principal(response, principal)
+            except ResponseContextAccessError as exc:
+                _record_request(
+                    start_time, model, "responses", 409, stream, str(exc),
+                    provider="native_codex", target_model=target_model,
+                )
+                return JSONResponse(
+                    content=build_error_response(str(exc), exc.code, 409),
+                    status_code=409,
+                )
             except NativeUpstreamHTTPError as exc:
                 error_msg = str(exc)
                 _audit_event(
@@ -3700,6 +3868,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                     effective_provider,
                     adapter,
                     api_key,
+                    access_key_id=principal.key_id,
                     proxy_url=_model_proxy_url(
                         cfg,
                         alias=model,
@@ -3713,7 +3882,16 @@ def create_app(verbose: bool = False) -> FastAPI:
                         start_time, model, "responses", response.status_code, False, "", provider_tokens,
                         provider=provider_name, target_model=target_model, client_ip=request_client_ip,
                     )
-                return response
+                return _bind_stream_principal(response, principal)
+            except ResponseContextAccessError as exc:
+                _record_request(
+                    start_time, model, "responses", 409, stream, str(exc),
+                    provider=route.provider, target_model=route.target_model,
+                )
+                return JSONResponse(
+                    content=build_error_response(str(exc), exc.code, 409),
+                    status_code=409,
+                )
             except ProviderResponsesHTTPError as exc:
                 error_msg = str(exc)
                 _record_request(
@@ -3802,7 +3980,21 @@ def create_app(verbose: bool = False) -> FastAPI:
             logger.info("视觉观察已转交文本模型继续执行: %s/%s", provider_name, target_model)
 
         had_previous_response_id = bool(body.get("previous_response_id"))
-        body, replayed_chat_context = prepare_chat_responses_payload(body, target_model)
+        try:
+            body, replayed_chat_context = prepare_chat_responses_payload(
+                body,
+                target_model,
+                access_key_id=principal.key_id,
+            )
+        except ResponseContextAccessError as exc:
+            _record_request(
+                start_time, model, "responses", 409, stream, str(exc),
+                provider=provider_name, target_model=target_model,
+            )
+            return JSONResponse(
+                content=build_error_response(str(exc), exc.code, 409),
+                status_code=409,
+            )
         replay_compacted = _compact_chat_replay_history(body.get("input", []) or [])
         if replay_compacted["trimmed_items"]:
             _audit_event(
@@ -3928,7 +4120,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                 _safe_log("Chat 请求详情", chat_req)
 
             if has_web_search and stream:
-                return StreamingResponse(
+                return _bind_stream_principal(StreamingResponse(
                     _cache_chat_response_stream(
                         _handle_web_search_stream(
                             client, adapter, chat_req, body, cfg, model, verbose, start_time,
@@ -3940,6 +4132,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                         ),
                         chat_context_input,
                         provider_name,
+                        principal.key_id,
                     ),
                     media_type="text/event-stream",
                     headers={
@@ -3947,7 +4140,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                         "Connection": "keep-alive",
                         "X-Accel-Buffering": "no",
                     },
-                )
+                ), principal)
 
             if has_web_search:
                 _audit_event("responses.upstream_start", request_id, mode="web_search")
@@ -3972,12 +4165,14 @@ def create_app(verbose: bool = False) -> FastAPI:
                     input_tools=input_tools, chat_tools=chat_tools,
                     upstream_api="chat",
                 )
-                _cache_chat_response(responses_resp, chat_context_input, provider_name)
+                _cache_chat_response(
+                    responses_resp, chat_context_input, provider_name, principal.key_id
+                )
                 return JSONResponse(content=responses_resp)
 
             if stream:
                 # 2. 流式处理
-                return StreamingResponse(
+                return _bind_stream_principal(StreamingResponse(
                     _cache_chat_response_stream(
                         _handle_stream(
                             client, adapter, chat_req, body, cfg, model, verbose, start_time,
@@ -3989,6 +4184,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                         ),
                         chat_context_input,
                         provider_name,
+                        principal.key_id,
                     ),
                     media_type="text/event-stream",
                     headers={
@@ -3996,7 +4192,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                         "Connection": "keep-alive",
                         "X-Accel-Buffering": "no",
                     },
-                )
+                ), principal)
 
             else:
                 # 3. 非流式处理
@@ -4073,7 +4269,9 @@ def create_app(verbose: bool = False) -> FastAPI:
                     input_tools=input_tools, chat_tools=chat_tools,
                     upstream_api="chat",
                 )
-                _cache_chat_response(responses_resp, chat_context_input, provider_name)
+                _cache_chat_response(
+                    responses_resp, chat_context_input, provider_name, principal.key_id
+                )
                 return JSONResponse(content=responses_resp)
 
         except Exception as exc:
@@ -4163,6 +4361,14 @@ def create_app(verbose: bool = False) -> FastAPI:
     @app.websocket("/v1/responses")
     async def responses_websocket_endpoint(websocket: WebSocket):
         """Adapt Codex Responses WebSocket frames to the existing HTTP/SSE route."""
+        try:
+            authenticate_bridge_headers(websocket.headers, get_config())
+        except BridgeAccessError as exc:
+            await websocket.close(
+                code=4401 if exc.status_code == 401 else 4503,
+                reason=str(exc)[:120],
+            )
+            return
         await websocket.accept()
         try:
             while True:
@@ -4180,6 +4386,25 @@ def create_app(verbose: bool = False) -> FastAPI:
 
                 body = dict(body)
                 body.pop("type", None)
+                try:
+                    principal = authenticate_bridge_headers(websocket.headers, get_config())
+                    require_model_access(principal, body.get("model", "unknown"))
+                except BridgeAccessError as exc:
+                    await websocket.send_json({
+                        "type": "error",
+                        "status": exc.status_code,
+                        "error": {
+                            "type": "bridge_access_error",
+                            "message": str(exc),
+                        },
+                    })
+                    if exc.status_code in (401, 503):
+                        await websocket.close(
+                            code=4401 if exc.status_code == 401 else 4503,
+                            reason=str(exc)[:120],
+                        )
+                        return
+                    continue
                 if body.pop("generate", True) is False:
                     response = build_responses_response([], body.get("model", "unknown"))
                     created = dict(response)
@@ -4190,7 +4415,9 @@ def create_app(verbose: bool = False) -> FastAPI:
 
                 body["stream"] = True
                 request = await _responses_request_from_websocket(websocket, body)
-                response = await responses_endpoint(request)
+                request.state.bridge_principal = principal
+                with bridge_principal_context(principal):
+                    response = await responses_endpoint(request)
                 await _send_sse_response_over_websocket(websocket, response)
         except WebSocketDisconnect:
             return
@@ -4215,6 +4442,21 @@ def create_app(verbose: bool = False) -> FastAPI:
 
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
+        principal = _request_bridge_principal(request)
+        denied = _model_access_response(principal, model)
+        if denied is not None:
+            _record_request(start_time, model, "chat", 403, bool(stream), "model permission denied")
+            return denied
+        for dependency in _configured_model_dependency_aliases(
+            get_config(), model, body, "chat"
+        ):
+            denied = _model_access_response(principal, dependency)
+            if denied is not None:
+                _record_request(
+                    start_time, model, "chat", 403, bool(stream),
+                    "dependent model permission denied",
+                )
+                return denied
         _audit_event(
             "chat.received",
             request_id,
@@ -4333,14 +4575,14 @@ def create_app(verbose: bool = False) -> FastAPI:
                         yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
 
-                return StreamingResponse(
+                return _bind_stream_principal(StreamingResponse(
                     _sse_gen(),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache, no-transform",
                         "X-Accel-Buffering": "no",
                     },
-                )
+                ), principal)
             else:
                 _audit_event("chat.upstream_start", request_id, mode="non_stream")
                 upstream_start = time.time()
@@ -4388,6 +4630,7 @@ def create_app(verbose: bool = False) -> FastAPI:
     async def images_generations(request: Request):
         """图片生成端点: 接受 DALL-E 格式请求，路由到配置的生图模型"""
         cfg = get_config()
+        start_time = time.time()
         request_id = uuid.uuid4().hex[:12]
         try:
             body = await _read_json_body(request, request_id, "images")
@@ -4395,7 +4638,17 @@ def create_app(verbose: bool = False) -> FastAPI:
             return JSONResponse({"error": {"message": "无效的 JSON 请求体"}}, 400)
 
         model = body.get("model", "unknown")
+        principal = _request_bridge_principal(request)
+        denied = _model_access_response(principal, model)
+        if denied is not None:
+            _record_request(start_time, model, "images", 403, False, "model permission denied")
+            return denied
         gen_alias, entry = _resolve_images_generation_entry(cfg, model)
+        if gen_alias != model:
+            denied = _model_access_response(principal, gen_alias)
+            if denied is not None:
+                _record_request(start_time, model, "images", 403, False, "dependent model permission denied")
+                return denied
 
         if not entry:
             return JSONResponse({"error": {"message": f"未找到模型: {model}"}}, 404)
@@ -4455,7 +4708,6 @@ def create_app(verbose: bool = False) -> FastAPI:
             body.get("prompt", "")[:80],
             body.get("size", "(provider default)"))
 
-        start_time = time.time()
         try:
             async with make_async_client(timeout=httpx.Timeout(120)) as client:
                 resp = await client.post(img_url, json=img_body, headers=headers)
@@ -5637,18 +5889,36 @@ def _responses_sse_payload(event_line: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def _cache_chat_response(response: dict, input_items: list, owner: str) -> None:
+def _cache_chat_response(
+    response: dict,
+    input_items: list,
+    owner: str,
+    access_key_id: str = "",
+) -> None:
     response_id = response.get("id") if isinstance(response, dict) else None
     output_items = response.get("output") if isinstance(response, dict) else None
     if isinstance(response_id, str) and isinstance(output_items, list):
-        _native_context_put(response_id, input_items, output_items, owner=owner)
+        _native_context_put(
+            response_id,
+            input_items,
+            output_items,
+            owner=owner,
+            access_key_id=access_key_id,
+        )
 
 
-async def _cache_chat_response_stream(event_stream, input_items: list, owner: str):
+async def _cache_chat_response_stream(
+    event_stream,
+    input_items: list,
+    owner: str,
+    access_key_id: str = "",
+):
     async for event_line in event_stream:
         payload = _responses_sse_payload(event_line)
         if payload and payload.get("type") == "response.completed":
-            _cache_chat_response(payload.get("response") or {}, input_items, owner)
+            _cache_chat_response(
+                payload.get("response") or {}, input_items, owner, access_key_id
+            )
         yield event_line
 
 
@@ -5914,6 +6184,9 @@ def _record_request(
     client_ip: str | None = None,
     upstream_api: str = "",
 ):
+    if _suppress_request_stats.get():
+        return
+    principal = current_bridge_principal()
     if not upstream_api:
         if provider == "native_codex":
             upstream_api = "responses"
@@ -5947,6 +6220,8 @@ def _record_request(
         input_tools=input_tools,
         chat_tools=chat_tools,
         first_response_ms=first_response_ms,
+        access_key_id=principal.key_id,
+        access_key_prefix=principal.prefix,
     ))
 
 def _record_and_respond(

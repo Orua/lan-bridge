@@ -38,6 +38,11 @@ const Settings: React.FC = () => {
     close_to_tray: true,
     audit_log_path: '',
     codex_official_proxy_url: '',
+    native_auth_injection: {
+      enabled: false,
+      auth_file: '',
+      auth_file_found: false,
+    },
   });
   const [saved, setSaved] = useState(false);
   const [importYaml, setImportYaml] = useState('');
@@ -53,7 +58,10 @@ const Settings: React.FC = () => {
     try {
       const s = await api.getSettings();
       setSettings(s);
-      setForm({ ...s.server });
+      setForm({
+        ...s.server,
+        native_auth_injection: { ...s.server.native_auth_injection },
+      });
     } catch {
       setSettings(null);
     }
@@ -232,6 +240,40 @@ const Settings: React.FC = () => {
             <input value={form.codex_official_proxy_url || ''}
               onChange={e => setForm({ ...form, codex_official_proxy_url: e.target.value })}
               placeholder="http://127.0.0.1:7890" />
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-section">
+        <h3>{tl(['主机 Codex 登录注入', 'Host Codex Login Injection'])}</h3>
+        <p className="field-hint">
+          {tl([
+            'OpenAI 登录凭据只保留在桥接电脑。客户端使用“访问密匙”页面分配的独立密匙，密匙可限制模型并统计 Token 用量。',
+            'OpenAI credentials stay only on this computer. Clients use keys issued on the Access Keys page, with per-model permissions and token usage tracking.',
+          ])}
+        </p>
+        <label className="checkbox-label">
+          <input type="checkbox" checked={form.native_auth_injection.enabled}
+            onChange={e => setForm({
+              ...form,
+              native_auth_injection: { ...form.native_auth_injection, enabled: e.target.checked },
+            })} />
+          {tl(['启用服务器端登录注入', 'Enable server-side login injection'])}
+        </label>
+        <div className="form-grid">
+          <div className="form-group full-width">
+            <label>{tl(['Codex auth.json 路径（留空自动检测）', 'Codex auth.json path (leave empty for auto-detect)'])}</label>
+            <input value={form.native_auth_injection.auth_file}
+              onChange={e => setForm({
+                ...form,
+                native_auth_injection: { ...form.native_auth_injection, auth_file: e.target.value },
+              })}
+              placeholder="%USERPROFILE%\\.codex\\auth.json" />
+            <span className="field-hint">
+              {form.native_auth_injection.auth_file_found
+                ? tl(['已找到登录缓存', 'Login cache found'])
+                : tl(['尚未找到登录缓存；请先在桥接电脑登录 Codex', 'Login cache not found; sign in to Codex on this computer first'])}
+            </span>
           </div>
         </div>
       </section>

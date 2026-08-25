@@ -76,6 +76,11 @@ export interface ServerSettings {
     close_to_tray: boolean;
     audit_log_path: string;
     codex_official_proxy_url: string;
+    native_auth_injection: {
+      enabled: boolean;
+      auth_file: string;
+      auth_file_found: boolean;
+    };
   };
   config_path: string;
 }
@@ -134,4 +139,32 @@ export interface CodexConfigStatus {
   using_bridge: boolean;
   details: Record<string, string>;
   catalog_available: boolean;
+}
+
+export interface AccessKeyRecord {
+  id: string;
+  name: string;
+  prefix: string;
+  allowed_models: string[];
+  enabled: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  request_count: number;
+  total_tokens: number;
+}
+
+export interface AccessKeyAvailableModel {
+  alias: string;
+  display_name: string;
+  route_kind: 'native_codex' | 'custom' | string;
+}
+
+export interface AccessKeysResponse {
+  keys: AccessKeyRecord[];
+  available_models: AccessKeyAvailableModel[];
+}
+
+export interface AccessKeySecretResponse {
+  key: string;
+  record: AccessKeyRecord;
 }

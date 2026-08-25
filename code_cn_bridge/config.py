@@ -13,6 +13,8 @@ from typing import Any, Iterator
 
 import yaml
 
+from .access_control import DEFAULT_ACCESS_CONTROL
+
 DEFAULT_CONFIG_PATHS = [
     Path.home() / ".lan-bridge.yaml",
     Path("config.yaml"),
@@ -55,6 +57,11 @@ DEFAULT_NATIVE_MODELS = {
         "description": "OpenAI Codex native model",
         "enabled": True,
     },
+}
+
+DEFAULT_NATIVE_AUTH_INJECTION = {
+    "enabled": False,
+    "auth_file": "",
 }
 
 
@@ -195,6 +202,7 @@ class Config:
                             self._redact_all_provider_keys_for_backup(
                                 current_data.get("web_search", {}).get("providers", {})
                             )
+                            self._redact_native_auth_for_backup(current_data)
                             backup_path = backup_dir / f"{self._config_path.name}.{stamp}.bak"
                             backup_path.write_text(
                                 yaml.dump(current_data, allow_unicode=True, default_flow_style=False),
@@ -279,6 +287,18 @@ class Config:
         web_search = _deep_merge(copy.deepcopy(DEFAULT_WEB_SEARCH), self._data.get("web_search", {}))
         self._data["web_search"] = web_search
         self._data.setdefault("native_models", copy.deepcopy(DEFAULT_NATIVE_MODELS))
+        self._data["access_control"] = _deep_merge(
+            copy.deepcopy(DEFAULT_ACCESS_CONTROL),
+            self._data.get("access_control", {}),
+        )
+        self._data["access_control"].pop("keys", None)
+        server = self._data.setdefault("server", {})
+        server["native_auth_injection"] = _deep_merge(
+            copy.deepcopy(DEFAULT_NATIVE_AUTH_INJECTION),
+            server.get("native_auth_injection", {}),
+        )
+        server["native_auth_injection"].pop("client_token", None)
+        server["native_auth_injection"].pop("client_token_env", None)
         self._inject_provider_env(web_search.get("providers", {}))
         self._normalize_mapping()
 
@@ -309,6 +329,17 @@ class Config:
             if isinstance(info, dict):
                 info.pop("api_key", None)
                 info.pop("_api_key_from_env", None)
+
+    @staticmethod
+    def _redact_native_auth_for_backup(data: dict) -> None:
+        server = data.get("server", {}) if isinstance(data, dict) else {}
+        settings = server.get("native_auth_injection", {}) if isinstance(server, dict) else {}
+        if isinstance(settings, dict):
+            settings.pop("client_token", None)
+            settings.pop("client_token_env", None)
+        access_control = data.get("access_control", {}) if isinstance(data, dict) else {}
+        if isinstance(access_control, dict):
+            access_control.pop("keys", None)
 
     def _normalize_mapping(self) -> None:
         """将旧格式 model_mapping ({alias: target_string}) 迁移到新格式 ({alias: {target, ...}})"""
@@ -568,7 +599,9 @@ class Config:
                 "codex_official_proxy_url": "",
                 "native_codex_base_url": "https://chatgpt.com/backend-api/codex",
                 "native_stream_timeout": 600,
+                "native_auth_injection": copy.deepcopy(DEFAULT_NATIVE_AUTH_INJECTION),
             },
+            "access_control": copy.deepcopy(DEFAULT_ACCESS_CONTROL),
             "native_models": copy.deepcopy(DEFAULT_NATIVE_MODELS),
             "providers": {
                 "qwen": {

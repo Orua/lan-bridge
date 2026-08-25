@@ -16,7 +16,7 @@ class Route:
     target_model: str
     provider: str = ""
     adapter: str = ""
-    auth_mode: Literal["passthrough", "provider_key"] = "provider_key"
+    auth_mode: Literal["host_login", "provider_key"] = "provider_key"
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -80,7 +80,7 @@ def resolve_route(config, model: str) -> Route:
                 target_model=target,
                 provider="native_codex",
                 adapter="native_codex",
-                auth_mode="passthrough",
+                auth_mode="host_login",
                 metadata=dict(entry),
             )
 
@@ -107,7 +107,7 @@ def resolve_route(config, model: str) -> Route:
             target_model=str(metadata.get("target") or requested),
             provider="native_codex",
             adapter="native_codex",
-            auth_mode="passthrough",
+            auth_mode="host_login",
             metadata=metadata,
         )
 

@@ -106,6 +106,7 @@ async def proxy_provider_responses(
     *,
     proxy_url: str = "",
     on_trace: Callable[[str, dict[str, Any]], None] | None = None,
+    access_key_id: str = "",
 ) -> Response:
     """Forward Responses bytes unchanged, apart from routing/auth and cross-provider replay."""
     timeout_seconds = float(provider.get("timeout", 120))
@@ -115,6 +116,7 @@ async def proxy_provider_responses(
         target_model,
         provider_name,
         supports_previous_response_id=bool(provider.get("supports_previous_response_id", False)),
+        access_key_id=access_key_id,
     )
     payload = _apply_provider_responses_compatibility(payload, provider_name)
     if on_trace is not None:
@@ -183,6 +185,7 @@ async def proxy_provider_responses(
                                 payload.get("input", []) if isinstance(payload.get("input"), list) else [],
                                 completed_output if isinstance(completed_output, list) and completed_output else output_items,
                                 owner=provider_name,
+                                access_key_id=access_key_id,
                             )
                             if on_trace is not None:
                                 on_trace("completed", {"response_id": response_id, **usage_fields})
@@ -217,6 +220,7 @@ async def proxy_provider_responses(
                     payload.get("input", []) if isinstance(payload.get("input"), list) else [],
                     output,
                     owner=provider_name,
+                    access_key_id=access_key_id,
                 )
             if on_trace is not None:
                 on_trace("completed", _usage_trace_fields(response_payload))

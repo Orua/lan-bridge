@@ -33,6 +33,13 @@ from .stats import get_stats, RequestLog
 from .client import UpstreamClient
 from .http_utils import make_async_client, make_provider_async_client
 from .native_proxy import custom_model_context_settings, merge_model_catalog
+from .codex_auth import resolve_auth_file
+from .access_control import (
+    BridgeAccessError,
+    access_control_enabled,
+    get_access_key_store,
+    public_access_key_record,
+)
 from .provider_proxy import model_uses_responses
 
 logger = logging.getLogger("lan-bridge")
@@ -175,7 +182,7 @@ async def get_status():
         "running": True,
         "host": cfg.server_host,
         "port": cfg.server_port,
-        "version": "0.1.0",
+        "version": "0.2.0",
         "stats": stats.get_summary(),
     }
 
@@ -778,6 +785,9 @@ async def get_settings():
     audit_log_path = server_cfg.get("audit_log_path", "")
     if str(log_level).lower() == "debug" and not str(audit_log_path).strip():
         audit_log_path = cfg.default_audit_log_path()
+    native_auth = server_cfg.get("native_auth_injection", {})
+    if not isinstance(native_auth, dict):
+        native_auth = {}
     return {
         "server": {
             "host": cfg.server_host,
@@ -788,6 +798,11 @@ async def get_settings():
             "close_to_tray": server_cfg.get("close_to_tray", True),
             "audit_log_path": audit_log_path,
             "codex_official_proxy_url": server_cfg.get("codex_official_proxy_url", ""),
+            "native_auth_injection": {
+                "enabled": bool(native_auth.get("enabled", False)),
+                "auth_file": str(native_auth.get("auth_file") or ""),
+                "auth_file_found": resolve_auth_file(cfg).is_file(),
+            },
         },
         "config_path": str(cfg._config_path) if cfg._config_path else "",
     }
@@ -797,6 +812,20 @@ async def get_settings():
 async def update_settings(data: dict):
     """更新全局设置"""
     cfg = get_config()
+    native_update = data.get("native_auth_injection")
+    if isinstance(native_update, dict):
+        if native_update.get("enabled") is True:
+            if not access_control_enabled(cfg):
+                raise HTTPException(status_code=400, detail="Enable LAN BRIDGE access control before login injection")
+            try:
+                has_enabled_key = any(
+                    record.get("enabled", True)
+                    for record in get_access_key_store(cfg).list_records()
+                )
+            except BridgeAccessError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if not has_enabled_key:
+                raise HTTPException(status_code=400, detail="Create an access key before enabling login injection")
     requested_port = None
     if "port" in data:
         try:
@@ -827,6 +856,13 @@ async def update_settings(data: dict):
             server_cfg["audit_log_path"] = data["audit_log_path"]
         if "codex_official_proxy_url" in data:
             server_cfg["codex_official_proxy_url"] = str(data["codex_official_proxy_url"]).strip()
+        if isinstance(data.get("native_auth_injection"), dict):
+            update = data["native_auth_injection"]
+            native_auth = server_cfg.setdefault("native_auth_injection", {})
+            if "enabled" in update:
+                native_auth["enabled"] = bool(update["enabled"])
+            if "auth_file" in update:
+                native_auth["auth_file"] = str(update["auth_file"] or "").strip()
 
         if str(server_cfg.get("log_level", "")).lower() == "debug" and not str(server_cfg.get("audit_log_path", "")).strip():
             server_cfg["audit_log_path"] = cfg.default_audit_log_path()
@@ -956,6 +992,130 @@ async def get_usage(day: str | None = None):
     return {"usage": stats.get_usage_summary(day)}
 
 
+def _available_access_models(cfg) -> list[dict[str, str]]:
+    models: dict[str, dict[str, str]] = {}
+    has_image_model = False
+    for alias, entry in cfg.native_models.items():
+        if isinstance(entry, dict) and not entry.get("enabled", True):
+            continue
+        models[str(alias)] = {
+            "alias": str(alias),
+            "display_name": str(entry.get("display_name") or alias) if isinstance(entry, dict) else str(alias),
+            "route_kind": "native_codex",
+        }
+    for alias, entry in cfg.model_mapping.items():
+        if not isinstance(entry, dict) or not entry.get("enabled", True):
+            continue
+        native = (
+            entry.get("route_kind") == "native_codex"
+            or entry.get("kind") == "native_codex"
+            or entry.get("provider") == "native_codex"
+        )
+        models[str(alias)] = {
+            "alias": str(alias),
+            "display_name": str(entry.get("display_name") or alias),
+            "route_kind": "native_codex" if native else "custom",
+        }
+        has_image_model = has_image_model or bool(entry.get("is_image_gen"))
+    if has_image_model:
+        for alias in ("gpt-image-1", "gpt-image-1.5", "gpt-image-2"):
+            models.setdefault(alias, {
+                "alias": alias,
+                "display_name": f"{alias} (image bridge alias)",
+                "route_kind": "custom",
+            })
+    return sorted(models.values(), key=lambda item: (item["route_kind"] != "native_codex", item["alias"]))
+
+
+def _access_key_payload(record: dict, usage: dict) -> dict:
+    payload = public_access_key_record(record)
+    totals = usage.get("by_key", {}).get(payload["id"], {})
+    payload.update({
+        "last_used_at": totals.get("last_used_at") or None,
+        "request_count": int(totals.get("requests", 0)),
+        "total_tokens": int(totals.get("tokens", 0)),
+    })
+    return payload
+
+
+@router.get("/access-keys")
+async def list_access_keys():
+    cfg = get_config()
+    try:
+        records = get_access_key_store(cfg).list_records()
+    except BridgeAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    usage = get_stats().get_usage_summary()
+    return {
+        "keys": [_access_key_payload(record, usage) for record in records],
+        "available_models": _available_access_models(cfg),
+    }
+
+
+@router.post("/access-keys")
+async def create_access_key(data: dict):
+    cfg = get_config()
+    allowed = {item["alias"] for item in _available_access_models(cfg)}
+    requested = [str(item) for item in data.get("allowed_models", [])]
+    invalid = sorted(set(requested) - allowed - {"*"})
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown model permission: {invalid[0]}")
+    try:
+        raw_key, record = get_access_key_store(cfg).create(data.get("name", ""), requested)
+        if not access_control_enabled(cfg):
+            with _edit_config(cfg) as config_data:
+                config_data.setdefault("access_control", {})["enabled"] = True
+    except (ValueError, BridgeAccessError) as exc:
+        status = exc.status_code if isinstance(exc, BridgeAccessError) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return {"key": raw_key, "record": _access_key_payload(record, {})}
+
+
+@router.put("/access-keys/{key_id}")
+async def update_access_key(key_id: str, data: dict):
+    cfg = get_config()
+    allowed = {item["alias"] for item in _available_access_models(cfg)}
+    if "allowed_models" in data:
+        requested = [str(item) for item in data.get("allowed_models", [])]
+        invalid = sorted(set(requested) - allowed - {"*"})
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown model permission: {invalid[0]}")
+    try:
+        record = get_access_key_store(cfg).update(key_id, data)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Access key not found") from exc
+    except (ValueError, BridgeAccessError) as exc:
+        status = exc.status_code if isinstance(exc, BridgeAccessError) else 400
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    return _access_key_payload(record, get_stats().get_usage_summary())
+
+
+@router.post("/access-keys/{key_id}/rotate")
+async def rotate_access_key(key_id: str):
+    cfg = get_config()
+    try:
+        raw_key, record = get_access_key_store(cfg).rotate(key_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Access key not found") from exc
+    except BridgeAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {
+        "key": raw_key,
+        "record": _access_key_payload(record, get_stats().get_usage_summary()),
+    }
+
+
+@router.delete("/access-keys/{key_id}")
+async def delete_access_key(key_id: str):
+    try:
+        get_access_key_store(get_config()).revoke(key_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Access key not found") from exc
+    except BridgeAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {"status": "ok"}
+
+
 @router.post("/logs/clear")
 async def clear_logs():
     """清空日志"""
@@ -1008,6 +1168,13 @@ async def export_config():
     for p in data.get("web_search", {}).get("providers", {}).values():
         p.pop("api_key", None)
         p.pop("_api_key_from_env", None)
+    native_auth = data.get("server", {}).get("native_auth_injection", {})
+    if isinstance(native_auth, dict):
+        native_auth.pop("client_token", None)
+        native_auth.pop("client_token_env", None)
+    access_control = data.get("access_control", {})
+    if isinstance(access_control, dict):
+        access_control.pop("keys", None)
     return {
         "yaml": yaml.dump(data, allow_unicode=True, default_flow_style=False),
         "config_path": str(cfg._config_path) if cfg._config_path else "",
@@ -1026,6 +1193,9 @@ async def import_config(data: dict):
         new_data = yaml.safe_load(yaml_str)
         if not isinstance(new_data, dict):
             return {"error": "配置根节点必须是对象"}, 400
+        access_control = new_data.get("access_control", {})
+        if isinstance(access_control, dict):
+            access_control.pop("keys", None)
         with _edit_config(cfg) as config_data:
             _deep_merge(config_data, new_data)
         return {"status": "ok"}

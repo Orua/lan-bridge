@@ -1,5 +1,6 @@
 import React from 'react';
 import { useApp } from '../App';
+import appIcon from '../../assets/icon.png';
 
 const About: React.FC = () => {
   const { tl } = useApp();
@@ -9,9 +10,9 @@ const About: React.FC = () => {
       <h2>{tl('about.title')} LAN BRIDGE</h2>
 
       <div className="about-card">
-        <div className="about-logo">&#9653;</div>
+        <img className="about-logo" src={appIcon} alt="LAN BRIDGE" />
         <h3>LAN BRIDGE</h3>
-        <p className="version">v0.1.0</p>
+        <p className="version">v0.2.0</p>
         <p className="about-desc">{tl('about.desc')}</p>
 
         <div className="about-features">
@@ -33,6 +34,8 @@ const About: React.FC = () => {
           </div>
         </div>
 
+        <p className="about-security">{tl('about.security')}</p>
+
         <div className="about-links">
           <a href="#" onClick={(e) => {
             e.preventDefault();
@@ -43,7 +46,7 @@ const About: React.FC = () => {
         </div>
 
         <p className="muted" style={{ marginTop: 16 }}>
-          License: MIT | Built with Electron + React + FastAPI
+          Open source under the MIT License | Built with Electron + React + FastAPI
         </p>
       </div>
     </div>

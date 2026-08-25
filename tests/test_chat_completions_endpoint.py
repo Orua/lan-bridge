@@ -8,11 +8,15 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from code_cn_bridge import server
+from code_cn_bridge.access_control import ANONYMOUS_PRINCIPAL
 from code_cn_bridge.adapters.base import BaseAdapter
 
 
 class _FakeConfig:
-    _data = {"server": {"audit_enabled": False}}
+    _data = {
+        "access_control": {"enabled": False},
+        "server": {"audit_enabled": False},
+    }
     model_mapping = {"workbuddy-model": {"provider": "fake", "target": "upstream-model", "enabled": True}}
 
     @staticmethod
@@ -78,6 +82,14 @@ class _InvalidUnicodeStreamClient(_FakeClient):
 
 
 class ChatCompletionsEndpointTests(unittest.TestCase):
+    def setUp(self):
+        bridge_auth = patch(
+            "code_cn_bridge.middleware.authenticate_bridge_headers",
+            return_value=ANONYMOUS_PRINCIPAL,
+        )
+        bridge_auth.start()
+        self.addCleanup(bridge_auth.stop)
+
     def test_audit_log_rotates_with_bounded_retention(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             audit_path = Path(temp_dir) / "audit.jsonl"
