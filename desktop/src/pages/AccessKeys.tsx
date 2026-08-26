@@ -13,7 +13,7 @@ const AccessKeys: React.FC = () => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [newName, setNewName] = useState('');
-  const [newModels, setNewModels] = useState<string[]>([]);
+  const [newModels, setNewModels] = useState<string[]>(['*']);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const [editModels, setEditModels] = useState<string[]>([]);
@@ -27,7 +27,7 @@ const AccessKeys: React.FC = () => {
       const result = await api.getAccessKeys();
       setKeys(result.keys);
       setModels(result.available_models);
-      setNewModels(current => current.length ? current : result.available_models.map(model => model.alias));
+      setNewModels(current => current.length ? current : ['*']);
     } catch (err: any) {
       setError(err.message || String(err));
     } finally {
@@ -43,7 +43,8 @@ const AccessKeys: React.FC = () => {
   );
 
   const toggleModel = (alias: string, selected: string[], setter: (next: string[]) => void) => {
-    setter(selected.includes(alias) ? selected.filter(item => item !== alias) : [...selected, alias]);
+    const explicit = selected.includes('*') ? models.map(model => model.alias) : selected;
+    setter(explicit.includes(alias) ? explicit.filter(item => item !== alias) : [...explicit, alias]);
   };
 
   const createKey = async () => {
@@ -153,6 +154,18 @@ const AccessKeys: React.FC = () => {
 
   const modelPicker = (selected: string[], setter: (next: string[]) => void) => (
     <div className="access-model-picker">
+      <label className={selected.includes('*') ? 'selected' : ''}>
+        <input
+          type="checkbox"
+          checked={selected.includes('*')}
+          onChange={() => setter(selected.includes('*') ? models.map(model => model.alias) : ['*'])}
+        />
+        <span>
+          <strong>{tl(['全部模型（含 Codex 内部模型）', 'All models, including internal Codex models'])}</strong>
+          <code>*</code>
+        </span>
+        <small>{tl(['不限制', 'UNRESTRICTED'])}</small>
+      </label>
       {models.map(model => (
         <label key={model.alias} className={selected.includes(model.alias) ? 'selected' : ''}>
           <input
@@ -176,7 +189,7 @@ const AccessKeys: React.FC = () => {
         <div>
           <span className="eyebrow">CLIENT ACCESS CONTROL</span>
           <h2>{tl(['访问密匙', 'Access Keys'])}</h2>
-          <p>{tl(['为每台客户端分配独立密匙，并限制其可以调用的模型。完整密匙只在创建或轮换时显示一次。', 'Issue a separate key to each client and limit which models it can call. The full key is shown only once after creation or rotation.'])}</p>
+            <p>{tl(['为每台客户端分配独立密匙。默认允许全部模型，也可按需限制；完整密匙只在创建或轮换时显示一次。', 'Issue a separate key to each client. Keys allow all models by default, or can be restricted as needed. The full key is shown only once after creation or rotation.'])}</p>
         </div>
         <div className="access-summary">
           <strong>{keys.length}</strong>
@@ -219,7 +232,8 @@ const AccessKeys: React.FC = () => {
         <div className="access-picker-heading">
           <span>{tl(['允许使用的模型', 'Allowed models'])}</span>
           <div>
-            <button className="btn btn-sm" onClick={() => setNewModels(models.map(model => model.alias))}>{tl(['全选', 'Select all'])}</button>
+            <button className="btn btn-sm" onClick={() => setNewModels(['*'])}>{tl(['不限制模型', 'Allow all'])}</button>
+            <button className="btn btn-sm" onClick={() => setNewModels(models.map(model => model.alias))}>{tl(['仅选目录全部', 'Select catalog'])}</button>
             <button className="btn btn-sm" onClick={() => setNewModels([])}>{tl(['清空', 'Clear'])}</button>
           </div>
         </div>
@@ -259,7 +273,9 @@ const AccessKeys: React.FC = () => {
 
               {editing ? modelPicker(editModels, setEditModels) : (
                 <div className="access-model-tags">
-                  {record.allowed_models.map(alias => <span key={alias}>{modelByAlias.get(alias)?.display_name || alias}<code>{alias}</code></span>)}
+                  {record.allowed_models.includes('*') ? (
+                    <span>{tl(['全部模型（含 Codex 内部模型）', 'All models, including internal Codex models'])}<code>*</code></span>
+                  ) : record.allowed_models.map(alias => <span key={alias}>{modelByAlias.get(alias)?.display_name || alias}<code>{alias}</code></span>)}
                 </div>
               )}
 

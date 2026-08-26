@@ -126,7 +126,8 @@ The server defaults to `127.0.0.1`, which is reachable only from the bridge
 host. LAN access requires explicitly binding to `0.0.0.0` or to a LAN interface
 address. The management API remains loopback-only. When `access_control.enabled`
 is true, every `/v1/*` HTTP or WebSocket request must carry a bridge-issued
-bearer key, and the requested model must be in that key's allowlist. Key
+bearer key. A key may allow every model (`*`, including internal Codex helper
+models such as auto-review) or use an explicit model allowlist. Key
 verifiers are stored as hashes in a separate local access-key store (not in
 exportable YAML); the raw value is displayed only once at creation or rotation.
 Keep the bridge on a trusted LAN or VPN, restrict the port with the host
@@ -216,7 +217,7 @@ Use these values after LAN BRIDGE is running:
 ```text
 Base URL: http://127.0.0.1:8765/v1
 API key: a LAN BRIDGE access key created in the desktop Access Keys page
-Model: one of the aliases allowed for that key
+Model: any model for an unrestricted key, or an explicitly allowed alias
 ```
 
 For a client on another trusted LAN device, use
@@ -263,8 +264,10 @@ On the bridge computer:
 1. Sign in to Codex with ChatGPT and use file-based credential storage
    (`cli_auth_credentials_store = "file"`). LAN BRIDGE auto-detects
    `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`.
-2. Create an access key in **Access Keys**, restrict it to the native model
-   aliases that it should use, and enable **Host Codex Login Injection**.
+2. Create an access key in **Access Keys**. Keep the default unrestricted mode
+   when Codex helper models such as auto-review must pass through, or select an
+   explicit model allowlist for a restricted client. Then enable **Host Codex
+   Login Injection**.
 3. Bind only to the required LAN interface and firewall the port to the selected
    client computer.
 

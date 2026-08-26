@@ -3451,7 +3451,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     app = FastAPI(
         title="LAN BRIDGE",
-        version="0.2.0",
+        version="0.2.1",
         description=(
             "Trusted-LAN OpenAI-compatible model bridge / "
             "面向可信局域网的 OpenAI 兼容模型桥接、路由与协议转换网关"
@@ -3481,7 +3481,7 @@ def create_app(verbose: bool = False) -> FastAPI:
         cfg = get_config()
         return {
             "status": "ok",
-            "version": "0.2.0",
+            "version": "0.2.1",
             "adapters": len(reg.list()),
         }
 
