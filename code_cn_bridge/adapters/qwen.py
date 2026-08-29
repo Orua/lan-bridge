@@ -162,3 +162,29 @@ class QwenAdapter(BaseAdapter):
         else:
             req["parameters"] = {}
         return req
+
+    def build_image_edit_url(self) -> str:
+        """千问图片生成与编辑共用多模态生成端点。"""
+        return self.build_image_gen_url()
+
+    def preprocess_image_edit_request(self, req: dict) -> dict:
+        """把标准化原图转换为 Qwen Image Edit 的多模态消息。"""
+        prompt = req.pop("prompt", "")
+        source_images = req.pop("_source_images", [])
+        size = str(req.pop("size", "")).strip()
+        if size.lower() == "auto":
+            size = "1024*1024"
+        else:
+            size = size.replace("x", "*").replace("X", "*")
+
+        content = []
+        for source in source_images:
+            if not isinstance(source, dict):
+                continue
+            image_value = source.get("url") or source.get("file_id")
+            if image_value:
+                content.append({"image": image_value})
+        content.append({"text": prompt})
+        req["input"] = {"messages": [{"role": "user", "content": content}]}
+        req["parameters"] = {"size": size} if size else {}
+        return req

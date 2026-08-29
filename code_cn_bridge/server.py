@@ -650,6 +650,9 @@ async def _download_generated_image_as_base64(image_url: str) -> str:
 
 
 _CODEX_HOSTED_IMAGE_MODEL_ALIASES = {
+    "image_gen",
+    "image_generation",
+    "image_edit",
     "gpt-image-1",
     "gpt-image-1.5",
     "gpt-image-2",
@@ -676,6 +679,100 @@ def _resolve_images_generation_entry(cfg, requested_model: str) -> tuple[str, di
         if isinstance(candidate, dict) and candidate.get("enabled", True) and candidate.get("is_image_gen"):
             return alias, candidate
     return requested_model, None
+
+
+def _normalize_image_edit_source(value: object) -> dict | None:
+    """Normalize a source image to the Bridge's internal JSON representation."""
+    if isinstance(value, str):
+        source = value.strip()
+        if not source:
+            return None
+        if source.startswith(("data:image/", "https://", "http://")):
+            return {"url": source}
+        return {"file_id": source}
+    if not isinstance(value, dict):
+        return None
+
+    file_id = value.get("file_id")
+    if isinstance(file_id, str) and file_id.strip():
+        return {"file_id": file_id.strip()}
+
+    candidate = value.get("url") or value.get("image_url") or value.get("image")
+    if isinstance(candidate, dict):
+        return _normalize_image_edit_source(candidate)
+    if isinstance(candidate, str) and candidate.strip():
+        return {"url": candidate.strip()}
+    return None
+
+
+def _normalize_image_edit_sources(body: dict) -> list[dict]:
+    """Collect source images from JSON-style image editing requests."""
+    raw_sources: list[object] = []
+    for key in ("image", "images", "image_url", "image_urls"):
+        value = body.get(key)
+        if isinstance(value, list):
+            raw_sources.extend(value)
+        elif value is not None:
+            raw_sources.append(value)
+
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for raw_source in raw_sources:
+        source = _normalize_image_edit_source(raw_source)
+        if not source:
+            continue
+        fingerprint = json.dumps(source, sort_keys=True, ensure_ascii=False)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        normalized.append(source)
+        if len(normalized) >= 3:
+            break
+    return normalized
+
+
+def _parse_multipart_image_edit_body(content_type: str, payload: bytes) -> dict:
+    """Parse OpenAI SDK-style multipart image edit requests without extra deps."""
+    from email import policy
+    from email.parser import BytesParser
+
+    if "multipart/form-data" not in content_type.lower():
+        raise ValueError("图片编辑请求必须使用 JSON 或 multipart/form-data")
+    envelope = (
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+        + payload
+    )
+    message = BytesParser(policy=policy.default).parsebytes(envelope)
+    if not message.is_multipart():
+        raise ValueError("无效的 multipart 图片编辑请求")
+
+    body: dict = {}
+    source_images: list[dict] = []
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        field_name = str(name).rstrip("[]")
+        raw_value = part.get_payload(decode=True) or b""
+        if field_name in ("image", "images"):
+            if not raw_value:
+                continue
+            media_type = part.get_content_type() or "application/octet-stream"
+            encoded = base64.b64encode(raw_value).decode("ascii")
+            source_images.append({"url": f"data:{media_type};base64,{encoded}"})
+            continue
+        if field_name == "mask":
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        body[field_name] = raw_value.decode(charset, errors="replace")
+
+    if source_images:
+        body["images"] = source_images
+    for numeric_field in ("n",):
+        value = body.get(numeric_field)
+        if isinstance(value, str) and value.isdigit():
+            body[numeric_field] = int(value)
+    return body
 
 
 def _image_dimensions_from_bytes(data: bytes) -> tuple[int, int] | None:
@@ -1061,6 +1158,20 @@ def _looks_like_image_generation_request(text: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
+def _looks_like_image_edit_request(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.lower()
+    patterns = (
+        r"(?:p图|修图|改图|图片编辑|图像编辑|照片编辑)",
+        r"(?:修改|编辑|调整|替换|去掉|移除|添加|增加|换掉|抠出|扩图).{0,24}(?:这张|原图|图片|图像|照片|背景|人物|物体)",
+        r"(?:这张|原图|图片|图像|照片|背景|人物|物体).{0,24}(?:修改|编辑|调整|替换|去掉|移除|添加|增加|换掉|抠出|扩图)",
+        r"\b(?:edit|modify|retouch|transform|replace|remove|add)\b.*\b(?:image|picture|photo|background|subject)\b",
+        r"\b(?:image|picture|photo|background|subject)\b.*\b(?:edit|modify|retouch|transform|replace|remove|add)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
 def _is_image_generation_routing_candidate(text: str) -> bool:
     """Return whether a short model classification call is worth making.
 
@@ -1071,6 +1182,8 @@ def _is_image_generation_routing_candidate(text: str) -> bool:
     if not text or _looks_like_image_generation_suppression(text):
         return False
     if _looks_like_image_generation_request(text):
+        return True
+    if _looks_like_image_edit_request(text):
         return True
     return bool(re.search(
         r"(?:图片|图像|照片|插画|海报|logo|头像|封面|壁纸|图标|image|picture|photo|poster|illustration|wallpaper|icon)",
@@ -1153,6 +1266,27 @@ def _latest_item_is_user_message(input_items: list[dict] | None) -> bool:
     return latest_item.get("type") == "message" and latest_item.get("role") == "user"
 
 
+def _has_explicit_image_tool(body: dict) -> bool:
+    """Return true when the Agent already supplied a callable image tool.
+
+    In that case the upstream model must decide whether to call it.  Text
+    classification is only a compatibility fallback for clients that could
+    not advertise an image tool at all.
+    """
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") in ("image_gen", "image_generation"):
+            return True
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(function.get("name") or "").lower()
+        if name in {"image_gen", "generate_image", "edit_image"}:
+            return True
+        if "goldenluck_imagegen" in name and name.endswith(("generate_image", "edit_image")):
+            return True
+    return False
+
+
 def _should_handle_image_generation(body: dict, has_image_gen: bool) -> bool:
     if body.get("_bridge_image_intent_checked"):
         return False
@@ -1200,8 +1334,9 @@ def _make_bridge_image_gen_tool() -> dict:
         "function": {
             "name": "image_gen",
             "description": (
-                "Generate an image from a text prompt. Call this when the user wants an image, "
-                "drawing, photo, illustration, character, product shot, scene, poster, or any other visual output."
+                "Generate a new image or edit source images from a text prompt. Call this when the user "
+                "wants an image, drawing, photo, illustration, character, product shot, scene, poster, "
+                "or asks to modify an image already present in the current turn."
             ),
             "parameters": {
                 "type": "object",
@@ -1313,8 +1448,9 @@ async def _classify_image_generation_intent(
     system_prompt = (
         "You are an image-generation intent classifier. Return one JSON object only, with exactly "
         "these fields: shouldGenerateImage (boolean), reason (short string), prompt (string). "
-        "Set shouldGenerateImage=true only when the user explicitly wants a NEW standalone visual "
-        "asset to be rendered by an image model. Requests to create or edit spreadsheets, documents, "
+        "Set shouldGenerateImage=true only when the user explicitly wants a NEW or EDITED standalone visual "
+        "asset to be rendered by an image model. Editing an uploaded source image counts as true. "
+        "Requests to create or edit spreadsheets, documents, "
         "presentations, PDFs, or other files are NOT image generation, even when they ask to find, "
         "insert, paste, place, number, arrange, download, or include product images. Requests to find "
         "existing product pictures are also NOT image generation. For false, prompt must be empty. "
@@ -1322,7 +1458,9 @@ async def _classify_image_generation_intent(
         "Example: '做一个表格，插入2个产品图片跟编号' => "
         '{"shouldGenerateImage":false,"reason":"spreadsheet file task","prompt":""}. '
         "Example: '生成一张两款产品摆在展台上的宣传图' => "
-        '{"shouldGenerateImage":true,"reason":"new visual requested","prompt":"..."}.'
+        '{"shouldGenerateImage":true,"reason":"new visual requested","prompt":"..."}. '
+        "Example: '把上传照片的背景换成白色' => "
+        '{"shouldGenerateImage":true,"reason":"source image edit requested","prompt":"..."}.'
     )
 
     for slot_name, alias in aliases:
@@ -2516,6 +2654,44 @@ def _has_images(input_items: list[dict]) -> bool:
                         return True
     return False
 
+
+def _extract_image_edit_sources_from_input(input_items: list[dict]) -> list[dict]:
+    """Extract up to three source images from the newest Responses turn."""
+    if not input_items:
+        return []
+
+    last_item = input_items[-1]
+    output_types = {"function_call_output", "custom_tool_call_output"}
+    if last_item.get("type") in output_types:
+        current_items = []
+        for item in reversed(input_items):
+            if item.get("type") not in output_types:
+                break
+            current_items.append(item)
+        current_items.reverse()
+    elif last_item.get("type") == "message" and last_item.get("role") == "user":
+        current_items = [last_item]
+    else:
+        current_items = [
+            item for item in reversed(input_items)
+            if item.get("type") == "message" and item.get("role") == "user"
+        ][:1]
+
+    raw_sources: list[object] = []
+    for item in current_items:
+        for field in ("content", "output"):
+            content = item.get(field, "")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") not in ("input_image", "image_url"):
+                    continue
+                raw_sources.append(
+                    part.get("image_url") or part.get("url") or part.get("image")
+                )
+
+    return _normalize_image_edit_sources({"images": raw_sources})
+
 def _current_turn_has_images(input_items: list[dict]) -> bool:
     """Return whether only the newly appended input still needs vision."""
     if not input_items:
@@ -2607,7 +2783,7 @@ async def _handle_responses_image_gen(
     prompt_override: str | None = None,
     finish_turn: bool = False,
 ) -> JSONResponse | StreamingResponse:
-    """拦截 image_gen 内置工具：从 input 提取提示词，调用生图 API，返回生成的图片"""
+    """执行 image_gen：有原图时修图，无原图时生图，并返回图片。"""
     import json as _json
     import base64 as _base64
 
@@ -2638,19 +2814,18 @@ async def _handle_responses_image_gen(
             status_code=400,
         )
 
-    # 2. 查找生图模型
-    img_alias = ""
+    source_images = _extract_image_edit_sources_from_input(body.get("input", []) or [])
+    is_image_edit = bool(source_images)
+
+    # 2. 始终使用桌面端配置的图片槽模型。
+    img_alias, img_entry = _resolve_images_generation_entry(cfg, "image_gen")
     img_target = ""
     img_provider = ""
-    mapping = cfg.model_mapping
-    for alias, entry in mapping.items():
-        if isinstance(entry, dict) and entry.get("is_image_gen"):
-            img_alias = alias
-            img_target = entry.get("target", alias)
-            img_provider = entry.get("provider", "")
-            break
+    if isinstance(img_entry, dict):
+        img_target = img_entry.get("target", img_alias)
+        img_provider = img_entry.get("provider", "")
 
-    if not img_alias:
+    if not img_entry:
         _audit_event("image_gen.error", request_id, error="no_image_gen_model")
         return JSONResponse(
             build_error_response("未配置生图模型，请在桌面端添加一个「图片生成」类型的模型", "no_image_gen_model"),
@@ -2683,9 +2858,15 @@ async def _handle_responses_image_gen(
     }
     if size:
         img_body["size"] = size
-    img_body = adapter.preprocess_image_gen_request(img_body)
+    if is_image_edit:
+        img_body["_source_images"] = source_images
+        img_body = adapter.preprocess_image_edit_request(img_body)
+    else:
+        img_body = adapter.preprocess_image_gen_request(img_body)
     cache_key = _image_gen_retry_cache_key(provider_name, img_body)
-    user_turn_cache_key = _image_gen_user_turn_cache_key(provider_name, img_target, body.get("input", []))
+    user_turn_cache_key = "" if is_image_edit else _image_gen_user_turn_cache_key(
+        provider_name, img_target, body.get("input", [])
+    )
     cached_output_items = None if finish_turn else _get_image_gen_retry_cache(user_turn_cache_key)
     cached_source = "user_turn" if cached_output_items is not None else ""
     if cached_output_items is None and not finish_turn:
@@ -2725,11 +2906,12 @@ async def _handle_responses_image_gen(
                 headers={"Cache-Control": "no-cache"},
             )
         return JSONResponse(content=response)
-    img_url = adapter.build_image_gen_url()
+    img_url = adapter.build_image_edit_url() if is_image_edit else adapter.build_image_gen_url()
     headers = adapter.get_headers(api_key)
 
-    logger.info("image_gen 拦截 → 调用生图 API: %s, prompt=%.80s..., size=%s",
-        img_url, prompt[:80], size)
+    operation = "edit" if is_image_edit else "generate"
+    logger.info("image_gen 拦截 → 调用图片 API: %s, operation=%s, prompt=%.80s..., size=%s",
+        img_url, operation, prompt[:80], size)
     _audit_event(
         "image_gen.upstream_start",
         request_id,
@@ -2739,6 +2921,8 @@ async def _handle_responses_image_gen(
         prompt_chars=len(prompt),
         prompt_preview=prompt[:600],
         has_size="size" in img_body,
+        operation=operation,
+        source_image_count=len(source_images),
     )
 
     try:
@@ -2831,8 +3015,14 @@ async def _handle_responses_image_gen(
     _put_image_gen_retry_cache(cache_key, output_items)
     _put_image_gen_retry_cache(user_turn_cache_key, output_items)
 
-    logger.info("image_gen 完成: prompt=%.80s..., file=%s", prompt[:80], img_filename)
-    _audit_event("image_gen.completed", request_id, file=str(img_filepath), source_url=bool(image_url_from_api))
+    logger.info("image_gen 完成: operation=%s, prompt=%.80s..., file=%s", operation, prompt[:80], img_filename)
+    _audit_event(
+        "image_gen.completed",
+        request_id,
+        file=str(img_filepath),
+        source_url=bool(image_url_from_api),
+        operation=operation,
+    )
     if start_time is not None:
         _record_request(
             start_time,
@@ -3451,7 +3641,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     app = FastAPI(
         title="LAN BRIDGE",
-        version="0.2.1",
+        version="0.2.2",
         description=(
             "Trusted-LAN OpenAI-compatible model bridge / "
             "面向可信局域网的 OpenAI 兼容模型桥接、路由与协议转换网关"
@@ -3481,7 +3671,7 @@ def create_app(verbose: bool = False) -> FastAPI:
         cfg = get_config()
         return {
             "status": "ok",
-            "version": "0.2.1",
+            "version": "0.2.2",
             "adapters": len(reg.list()),
         }
 
@@ -4036,17 +4226,34 @@ def create_app(verbose: bool = False) -> FastAPI:
         )
 
         try:
-            # A model-generated image tool call is not enough to establish
-            # intent: requests such as "insert an image into the spreadsheet"
-            # are file-editing requests. Ask the text model once for a short
-            # routing decision before exposing the image tool to it.
+            # Prefer an actual model tool call.  Run the narrow text-slot
+            # classifier only for legacy/custom clients that failed to expose
+            # any callable image tool.
             input_items = body.get("input", []) or []
             latest_text = _latest_user_text(input_items)
             image_route_candidate = (
+                not _has_explicit_image_tool(body)
+                and
                 _latest_item_is_user_message(input_items)
                 and _is_image_generation_routing_candidate(latest_text)
             )
             if image_route_candidate:
+                if _current_turn_has_images(input_items) and _looks_like_image_edit_request(latest_text):
+                    _audit_event(
+                        "responses.image_generation_intercept",
+                        request_id,
+                        source="explicit_image_edit",
+                        prompt_chars=len(latest_text),
+                    )
+                    return await _handle_responses_image_gen(
+                        body,
+                        cfg,
+                        model,
+                        request_id,
+                        start_time,
+                        prompt_override=latest_text,
+                        finish_turn=False,
+                    )
                 latest_content = next(
                     (
                         item.get("content", "")
@@ -4750,6 +4957,140 @@ def create_app(verbose: bool = False) -> FastAPI:
             return JSONResponse({"error": {"message": "生图请求超时（120秒）"}}, 504)
         except Exception as exc:
             logger.exception("生图请求异常")
+            return JSONResponse({"error": {"message": str(exc)}}, 500)
+
+    @app.post("/v1/images/edits")
+    async def images_edits(request: Request):
+        """图片编辑端点：使用已配置的图片槽模型处理 JSON 或 multipart 原图。"""
+        cfg = get_config()
+        request_id = uuid.uuid4().hex[:12]
+        content_type = request.headers.get("content-type", "")
+        try:
+            if "multipart/form-data" in content_type.lower():
+                body = _parse_multipart_image_edit_body(content_type, await request.body())
+            else:
+                body = await _read_json_body(request, request_id, "images_edit")
+        except ValueError as exc:
+            return JSONResponse({"error": {"message": str(exc)}}, 400)
+
+        source_images = _normalize_image_edit_sources(body)
+        if not source_images:
+            return JSONResponse(
+                {"error": {"message": "图片编辑请求缺少原图", "code": "missing_image"}},
+                400,
+            )
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            return JSONResponse(
+                {"error": {"message": "图片编辑请求缺少 prompt", "code": "missing_prompt"}},
+                400,
+            )
+
+        requested_model = str(body.get("model") or "image_gen")
+        gen_alias, entry = _resolve_images_generation_entry(cfg, requested_model)
+        if not entry:
+            return JSONResponse({"error": {"message": f"未找到模型: {requested_model}"}}, 404)
+
+        if entry.get("is_image_gen"):
+            gen_target = entry.get("target", gen_alias)
+            gen_provider = entry.get("provider", "")
+        elif entry.get("image_gen_alias"):
+            gen_alias = entry["image_gen_alias"]
+            gen_entry = cfg.model_mapping.get(gen_alias)
+            if not isinstance(gen_entry, dict):
+                return JSONResponse({"error": {"message": f"图片槽模型未找到: {gen_alias}"}}, 400)
+            gen_target = gen_entry.get("target", gen_alias)
+            gen_provider = gen_entry.get("provider", "")
+        else:
+            return JSONResponse(
+                {"error": {"message": f"模型 '{requested_model}' 未关联图片槽"}},
+                400,
+            )
+
+        provider_name = gen_provider or cfg._find_provider_for_target(gen_target)
+        if not provider_name or provider_name not in cfg.providers:
+            return JSONResponse({"error": {"message": f"未找到图片 provider: {gen_alias}"}}, 400)
+        try:
+            adapter, _, _, api_key = _resolve_adapter(provider_name, gen_target)
+        except ValueError as exc:
+            return JSONResponse({"error": {"message": str(exc)}}, 400)
+
+        edit_body = {
+            "model": gen_target,
+            "prompt": prompt,
+            "n": body.get("n", 1),
+            "_source_images": source_images,
+        }
+        if body.get("size"):
+            edit_body["size"] = body["size"]
+        for key in (
+            "response_format", "quality", "style", "user", "output_format",
+            "watermark", "negative_prompt", "seed", "steps", "guidance_scale",
+            "aspect_ratio", "resolution",
+        ):
+            if key in body:
+                edit_body[key] = body[key]
+
+        edit_body = adapter.preprocess_image_edit_request(edit_body)
+        edit_url = adapter.build_image_edit_url()
+        headers = adapter.get_headers(api_key)
+        start_time = time.time()
+        logger.info(
+            "修图请求 → %s/%s: sources=%d, prompt=%.80s...",
+            provider_name,
+            gen_target,
+            len(source_images),
+            prompt[:80],
+        )
+        _audit_event(
+            "image_edit.upstream_start",
+            request_id,
+            provider=provider_name,
+            target_model=gen_target,
+            source_image_count=len(source_images),
+            prompt_chars=len(prompt),
+        )
+
+        try:
+            async with make_async_client(timeout=httpx.Timeout(120)) as client:
+                resp = await client.post(edit_url, json=edit_body, headers=headers)
+                result = resp.json()
+            _record_request(
+                start_time,
+                gen_alias,
+                "images_edit",
+                resp.status_code,
+                False,
+                error="" if resp.status_code == 200 else str((result.get("error") or {}).get("message", "")),
+                provider=provider_name,
+                target_model=gen_target,
+            )
+            if resp.status_code != 200:
+                return JSONResponse(content=result, status_code=resp.status_code)
+
+            image_data, image_url = _extract_generated_image_reference(result)
+            if not image_data and not image_url:
+                return JSONResponse(
+                    {"error": {"message": "修图 API 返回了结果但没有图片数据", "code": "no_image_data"}},
+                    500,
+                )
+            if not image_data:
+                image_data = await _download_generated_image_as_base64(image_url)
+            _audit_event(
+                "image_edit.completed",
+                request_id,
+                provider=provider_name,
+                target_model=gen_target,
+                source_image_count=len(source_images),
+            )
+            return JSONResponse(
+                content={"created": int(time.time()), "data": [{"b64_json": image_data}]},
+                status_code=200,
+            )
+        except httpx.TimeoutException:
+            return JSONResponse({"error": {"message": "修图请求超时（120秒）"}}, 504)
+        except Exception as exc:
+            logger.exception("修图请求异常")
             return JSONResponse({"error": {"message": str(exc)}}, 500)
 
     return app

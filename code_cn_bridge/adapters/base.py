@@ -78,6 +78,27 @@ class BaseAdapter(ABC):
             return base
         return f"{base}/images/generations"
 
+    def build_image_edit_url(self) -> str:
+        """构建 Image Editing API URL（xAI/OpenAI JSON 兼容格式）"""
+        base = self.base_url.rstrip("/")
+        if base.endswith("/images/edits"):
+            return base
+        return f"{base}/images/edits"
+
     def preprocess_image_gen_request(self, req: dict) -> dict:
         """生图请求预处理 —— 子类可覆盖以适配不同生图 API 格式"""
+        return req
+
+    def preprocess_image_edit_request(self, req: dict) -> dict:
+        """修图请求预处理。
+
+        Bridge 内部使用 ``_source_images`` 保存标准化的 ``url`` 或
+        ``file_id`` 对象。默认转换为 xAI/OpenAI JSON 风格；厂商适配器可
+        覆盖为自己的多模态格式。
+        """
+        source_images = req.pop("_source_images", [])
+        if len(source_images) == 1:
+            req["image"] = source_images[0]
+        elif source_images:
+            req["images"] = source_images
         return req

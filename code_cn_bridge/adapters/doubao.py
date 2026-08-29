@@ -30,6 +30,19 @@ class DoubaoAdapter(BaseAdapter):
             req["watermark"] = False
         return req
 
+    def build_image_edit_url(self) -> str:
+        """SeedEdit 与 Seedream 共用 Ark images/generations 端点。"""
+        return self.build_image_gen_url()
+
+    def preprocess_image_edit_request(self, req: dict) -> dict:
+        """把标准化原图转换为 Ark SeedEdit 的 image 字段。"""
+        source_images = req.pop("_source_images", [])
+        if source_images:
+            source = source_images[0]
+            if isinstance(source, dict):
+                req["image"] = source.get("url") or source.get("file_id")
+        return self.preprocess_image_gen_request(req)
+
     # build_image_gen_url() 使用基类默认实现:
     #   {base_url}/images/generations -> https://ark.cn-beijing.volces.com/api/v3/images/generations
     # 与官方教程一致

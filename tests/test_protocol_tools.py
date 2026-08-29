@@ -1,6 +1,7 @@
 import json
 import asyncio
 import unittest
+import httpx
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,15 +27,21 @@ from code_cn_bridge.server import _extract_generated_image_reference
 from code_cn_bridge.server import _download_generated_image_as_base64
 from code_cn_bridge.server import _extract_image_generation_prompt
 from code_cn_bridge.server import _extract_workspace_dir_from_responses_body
+from code_cn_bridge.server import _has_explicit_image_tool
 from code_cn_bridge.server import _finalize_image_generation_output
 from code_cn_bridge.server import _image_generation_output_dir
 from code_cn_bridge.server import _is_meta_review_request
 from code_cn_bridge.server import _is_image_generation_routing_candidate
 from code_cn_bridge.server import _looks_like_image_generation_suppression
+from code_cn_bridge.server import _looks_like_image_edit_request
+from code_cn_bridge.server import _normalize_image_edit_sources
+from code_cn_bridge.server import _parse_multipart_image_edit_body
+from code_cn_bridge.server import _extract_image_edit_sources_from_input
 from code_cn_bridge.server import _resolve_images_generation_entry
 from code_cn_bridge.server import _parse_image_intent_decision
 from code_cn_bridge.server import _should_handle_image_generation
 from code_cn_bridge.server import _strip_too_small_images_from_input
+from code_cn_bridge.server import create_app
 
 
 class ProtocolToolTests(unittest.TestCase):
@@ -65,6 +72,152 @@ class ProtocolToolTests(unittest.TestCase):
             _resolve_images_generation_entry(cfg, "not-a-real-model"),
             ("not-a-real-model", None),
         )
+
+    def test_image_gen_alias_resolves_to_configured_image_slot(self):
+        cfg = SimpleNamespace(
+            model_mapping={
+                "grok-image": {
+                    "target": "grok-imagine-image-2.0",
+                    "provider": "xai",
+                    "is_image_gen": True,
+                },
+            },
+            _data={"model_slots": {"image_gen": {"alias": "grok-image"}}},
+        )
+
+        alias, entry = _resolve_images_generation_entry(cfg, "image_gen")
+
+        self.assertEqual(alias, "grok-image")
+        self.assertEqual(entry["target"], "grok-imagine-image-2.0")
+
+    def test_normalizes_json_image_edit_sources(self):
+        result = _normalize_image_edit_sources({
+            "image": {"url": "data:image/png;base64,abc"},
+            "images": [
+                {"url": "https://example.test/source.png"},
+                {"file_id": "file_123"},
+            ],
+        })
+
+        self.assertEqual(result, [
+            {"url": "data:image/png;base64,abc"},
+            {"url": "https://example.test/source.png"},
+            {"file_id": "file_123"},
+        ])
+
+    def test_extracts_current_responses_turn_as_edit_source(self):
+        result = _extract_image_edit_sources_from_input([{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "把背景改成白色"},
+                {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+            ],
+        }])
+
+        self.assertEqual(result, [{"url": "data:image/png;base64,abc"}])
+
+    def test_parses_openai_multipart_image_edit_request(self):
+        boundary = "bridge-test-boundary"
+        payload = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="model"\r\n\r\n'
+            "gpt-image-1\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="prompt"\r\n\r\n'
+            "add a red border\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="image"; filename="source.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode() + b"png-bytes\r\n" + f"--{boundary}--\r\n".encode()
+
+        body = _parse_multipart_image_edit_body(
+            f"multipart/form-data; boundary={boundary}",
+            payload,
+        )
+
+        self.assertEqual(body["model"], "gpt-image-1")
+        self.assertEqual(body["prompt"], "add a red border")
+        self.assertTrue(body["images"][0]["url"].startswith("data:image/png;base64,"))
+
+    def test_images_edits_routes_to_configured_image_slot_and_returns_image(self):
+        cfg = SimpleNamespace(
+            model_mapping={
+                "grok-image": {
+                    "target": "grok-imagine-image-2.0",
+                    "provider": "xai",
+                    "is_image_gen": True,
+                },
+            },
+            providers={"xai": {"adapter": "openai"}},
+            data={"access_control": {"enabled": False}},
+            _data={
+                "server": {},
+                "model_slots": {"image_gen": {"alias": "grok-image"}},
+            },
+            slot_alias=lambda slot: "grok-image" if slot == "image_gen" else "",
+            _find_provider_for_target=lambda target: "xai",
+            get_provider=lambda name: {"adapter": "openai"} if name == "xai" else None,
+            server_host="127.0.0.1",
+            server_port=8765,
+        )
+        adapter = OpenAICompatibleAdapter()
+        adapter.base_url = "https://api.x.ai/v1"
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"data": [{"b64_json": "ZWRpdGVkLWltYWdl"}]}
+
+        class FakeClient:
+            def __init__(self):
+                self.posted_json = None
+                self.posted_url = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, headers):
+                self.posted_url = url
+                self.posted_json = json
+                return FakeResponse()
+
+        fake_client = FakeClient()
+
+        async def exercise():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://bridge.test") as client:
+                return await client.post("/v1/images/edits", json={
+                    "model": "image_gen",
+                    "prompt": "add a red border",
+                    "image": {"url": "data:image/png;base64,c291cmNl"},
+                })
+
+        with (
+            patch("code_cn_bridge.server.get_config", return_value=cfg),
+            patch("code_cn_bridge.config.get_config", return_value=cfg),
+            patch(
+                "code_cn_bridge.server._resolve_adapter",
+                return_value=(adapter, "xai", "grok-imagine-image-2.0", "secret"),
+            ),
+            patch("code_cn_bridge.server.make_async_client", return_value=fake_client),
+        ):
+            app = create_app()
+            response = asyncio.run(exercise())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"][0]["b64_json"], "ZWRpdGVkLWltYWdl")
+        self.assertEqual(fake_client.posted_url, "https://api.x.ai/v1/images/edits")
+        self.assertEqual(
+            fake_client.posted_json["image"],
+            {"url": "data:image/png;base64,c291cmNl"},
+        )
+        self.assertEqual(fake_client.posted_json["model"], "grok-imagine-image-2.0")
 
     def test_web_search_tool_description_includes_bridge_date(self):
         request = translate_request(
@@ -331,6 +484,24 @@ class ProtocolToolTests(unittest.TestCase):
     def test_ambiguous_spreadsheet_image_request_is_classification_candidate(self):
         self.assertTrue(_is_image_generation_routing_candidate("找10个无LOGO的拉牌，插入图片，插入编号"))
         self.assertFalse(_is_image_generation_routing_candidate("把这张图片导出为 PNG"))
+
+    def test_agent_image_tools_disable_text_intent_intercept(self):
+        self.assertTrue(_has_explicit_image_tool({
+            "tools": [{
+                "type": "function",
+                "name": "mcp__goldenluck_imagegen__generate_image",
+                "description": "Generate an image",
+            }]
+        }))
+        self.assertTrue(_has_explicit_image_tool({
+            "tools": [{
+                "type": "function",
+                "function": {"name": "edit_image"},
+            }]
+        }))
+        self.assertFalse(_has_explicit_image_tool({
+            "tools": [{"type": "function", "name": "exec_command"}]
+        }))
 
     def test_parses_json_image_intent_decision(self):
         decision = _parse_image_intent_decision({
@@ -664,6 +835,49 @@ class ProtocolToolTests(unittest.TestCase):
         })
 
         self.assertEqual(body["parameters"]["size"], "1536*1024")
+
+    def test_openai_compatible_image_edit_uses_json_image_object(self):
+        adapter = OpenAICompatibleAdapter()
+        body = adapter.preprocess_image_edit_request({
+            "model": "grok-imagine-image-2.0",
+            "prompt": "add a red border",
+            "_source_images": [{"url": "data:image/png;base64,abc"}],
+        })
+
+        self.assertEqual(body["image"], {"url": "data:image/png;base64,abc"})
+        self.assertNotIn("_source_images", body)
+
+    def test_qwen_image_edit_uses_multimodal_generation_message(self):
+        adapter = QwenAdapter()
+        body = adapter.preprocess_image_edit_request({
+            "model": "qwen-image-edit",
+            "prompt": "把背景改成白色",
+            "size": "1024x1024",
+            "_source_images": [{"url": "data:image/png;base64,abc"}],
+        })
+
+        content = body["input"]["messages"][0]["content"]
+        self.assertEqual(content[0], {"image": "data:image/png;base64,abc"})
+        self.assertEqual(content[1], {"text": "把背景改成白色"})
+        self.assertEqual(body["parameters"]["size"], "1024*1024")
+        self.assertEqual(adapter.build_image_edit_url(), adapter.build_image_gen_url())
+
+    def test_doubao_image_edit_uses_seededit_generation_endpoint(self):
+        adapter = DoubaoAdapter()
+        body = adapter.preprocess_image_edit_request({
+            "model": "doubao-seededit",
+            "prompt": "add a red border",
+            "_source_images": [{"url": "https://example.test/source.png"}],
+        })
+
+        self.assertEqual(body["image"], "https://example.test/source.png")
+        self.assertFalse(body["watermark"])
+        self.assertEqual(adapter.build_image_edit_url(), adapter.build_image_gen_url())
+
+    def test_recognizes_explicit_image_edit_intent(self):
+        self.assertTrue(_looks_like_image_edit_request("帮我P图，把这张照片背景换成白色"))
+        self.assertTrue(_looks_like_image_edit_request("remove the background from this image"))
+        self.assertFalse(_looks_like_image_edit_request("把图片插入 Excel"))
 
     def test_extracts_qwen_generated_image_url(self):
         response = {
