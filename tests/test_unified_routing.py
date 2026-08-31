@@ -199,6 +199,42 @@ class UnifiedRoutingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(observed["client_version"], "0.0.0")
 
+    def test_models_proxy_also_returns_openai_compatible_model_list(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"models": [{
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6 Sol",
+                "visibility": "list",
+                "supported_in_api": True,
+            }]})
+
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/v1/models",
+            "raw_path": b"/v1/models",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 12345),
+            "server": ("127.0.0.1", 8765),
+        })
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        with patch("code_cn_bridge.native_proxy._native_client", return_value=client):
+            response = asyncio.run(fetch_merged_models(request, FakeConfig()))
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["object"], "list")
+        data_by_id = {item["id"]: item for item in payload["data"]}
+        self.assertEqual(data_by_id["gpt-5.6-sol"], {
+            "id": "gpt-5.6-sol",
+            "object": "model",
+            "created": 0,
+            "owned_by": "lan-bridge",
+        })
+        self.assertIn("gpt-5.6-sol", [model["slug"] for model in payload["models"]])
+
     def test_native_payload_drops_non_native_encrypted_content_and_previous_id(self):
         payload = normalize_native_payload({
             "model": "alias",

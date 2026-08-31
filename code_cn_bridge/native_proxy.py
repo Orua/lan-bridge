@@ -867,6 +867,36 @@ def custom_model_info(
     }
 
 
+def add_openai_model_list(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Expose the merged Codex catalog through OpenAI's ``/v1/models`` shape.
+
+    Codex Desktop consumes the richer ``models`` array, while ordinary
+    OpenAI-compatible clients expect ``object: list`` and ``data`` entries.
+    Keep both views in one response so configuring Codex against the bridge
+    does not make the endpoint less useful to standard API callers.
+    """
+    result = dict(catalog)
+    data = []
+    for model in result.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        model_id = str(model.get("slug") or model.get("id") or "").strip()
+        if not model_id:
+            continue
+        created = model.get("created", 0)
+        if not isinstance(created, int) or created < 0:
+            created = 0
+        data.append({
+            "id": model_id,
+            "object": "model",
+            "created": created,
+            "owned_by": str(model.get("owned_by") or "lan-bridge"),
+        })
+    result["object"] = "list"
+    result["data"] = data
+    return result
+
+
 def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any]:
     supported_reasoning_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
     native_models = []
@@ -945,7 +975,7 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
         by_slug[str(alias)] = custom_model_info(str(alias), entry, provider)
     merged = dict(native_payload)
     merged["models"] = sorted(by_slug.values(), key=lambda item: (int(item.get("priority", 100)), str(item.get("slug", ""))))
-    return merged
+    return add_openai_model_list(merged)
 
 
 async def fetch_merged_models(request: Request, config) -> Response:
