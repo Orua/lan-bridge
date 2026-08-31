@@ -12,7 +12,7 @@ const About: React.FC = () => {
       <div className="about-card">
         <img className="about-logo" src={appIcon} alt="LAN BRIDGE" />
         <h3>LAN BRIDGE</h3>
-        <p className="version">v0.2.0</p>
+        <p className="version">v{__APP_VERSION__}</p>
         <p className="about-desc">{tl('about.desc')}</p>
 
         <div className="about-features">

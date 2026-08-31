@@ -7,9 +7,11 @@ from pathlib import Path
 
 import click
 
+from . import __version__
+
 
 @click.group()
-@click.version_option(version="0.2.2", prog_name="lan-bridge")
+@click.version_option(version=__version__, prog_name="lan-bridge")
 def main():
     """LAN BRIDGE - 可信局域网模型桥接网关
 
@@ -61,7 +63,7 @@ def start(config: str | None, port: int | None, host: str | None, verbose: bool)
     except (TypeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo("LAN BRIDGE v0.2.2")
+    click.echo(f"LAN BRIDGE v{__version__}")
     click.echo(f"服务地址: http://{bind_host}:{bind_port}")
     click.echo(f"配置文件: {cfg._config_path or '默认'}")
 

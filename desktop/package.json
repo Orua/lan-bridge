@@ -1,6 +1,6 @@
 {
   "name": "lan-bridge-desktop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "LAN BRIDGE Desktop - 可信局域网 OpenAI 兼容模型桥接与上游路由管理工具",
   "author": "Orua",
   "homepage": "https://github.com/Orua/lan-bridge",
@@ -11,10 +11,11 @@
     "build": "vite build && tsc -p tsconfig.electron.json",
     "preview": "vite preview",
     "electron:dev": "tsc -p tsconfig.electron.json && concurrently \"vite\" \"wait-on http://localhost:5173 && electron .\"",
-    "preelectron:build": "npm run verify:backend",
+    "preelectron:build": "npm run verify:version && npm run verify:backend",
     "electron:build": "vite build && tsc -p tsconfig.electron.json && electron-builder",
     "test:electron": "tsc -p tsconfig.electron.json && node --test tests/bridge-lifecycle.test.cjs tests/verify-backend.test.cjs",
     "verify:backend": "node scripts/verify-backend.cjs",
+    "verify:version": "python ../scripts/version.py --check",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

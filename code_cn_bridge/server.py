@@ -29,6 +29,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from . import __version__
 from .config import get_config, reload_config, reload_config_if_changed
 from .adapters import get_registry
 from .adapters.base import BaseAdapter
@@ -3641,7 +3642,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     app = FastAPI(
         title="LAN BRIDGE",
-        version="0.2.2",
+        version=__version__,
         description=(
             "Trusted-LAN OpenAI-compatible model bridge / "
             "面向可信局域网的 OpenAI 兼容模型桥接、路由与协议转换网关"
@@ -3671,7 +3672,7 @@ def create_app(verbose: bool = False) -> FastAPI:
         cfg = get_config()
         return {
             "status": "ok",
-            "version": "0.2.2",
+            "version": __version__,
             "adapters": len(reg.list()),
         }
 

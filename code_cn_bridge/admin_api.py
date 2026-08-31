@@ -24,6 +24,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from starlette.requests import HTTPConnection
 
+from . import __version__
 from .config import get_config
 from .config import get_bridge_root_dir
 from .config import get_model_catalog_path
@@ -182,7 +183,7 @@ async def get_status():
         "running": True,
         "host": cfg.server_host,
         "port": cfg.server_port,
-        "version": "0.2.2",
+        "version": __version__,
         "stats": stats.get_summary(),
     }
 
