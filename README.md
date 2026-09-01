@@ -227,6 +227,43 @@ a configuration error rather than accepting unauthenticated traffic.
 
 The desktop Settings page can update the local YAML, import/export redacted configuration, and switch Codex between LAN BRIDGE and official OpenAI routing.
 
+### WorkBuddy Chat-to-Responses compatibility
+
+WorkBuddy can keep using its normal OpenAI-compatible Chat Completions setting:
+
+```text
+Base URL: http://<bridge-host>:8765/v1
+Model: gpt-5.6-terra-wb-responses
+API key: a LAN BRIDGE access key
+useCustomProtocol: false
+```
+
+Create the alias in the desktop **Models** page, or add an equivalent mapping
+to `config.yaml`:
+
+```yaml
+model_mapping:
+  gpt-5.6-terra-wb-responses:
+    target: gpt-5.6-terra
+    upstream_model: gpt-5.6-terra
+    provider: openai-compatible
+    inbound_protocol: chat_completions
+    upstream_protocol: responses
+    wire_api: responses
+    enabled: true
+    capabilities:
+      reasoning: true
+      image_input: true
+      parallel_tool_calls: true
+```
+
+The alias is deliberately explicit: the bridge converts Chat `messages` to
+Responses `input`, calls `/v1/responses`, and converts the JSON or SSE result
+back to the Chat Completions shape expected by WorkBuddy. Existing aliases
+without this exact inbound/upstream pairing keep their current Chat or native
+Responses behavior. Unsupported Chat-only parameters are removed according to
+the model capability settings and recorded only as debug-level field names.
+
 ### Official Codex custom provider
 
 Codex can use the bridge as a custom Responses provider. The following is a

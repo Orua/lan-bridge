@@ -17,6 +17,8 @@ const SLOT_META: Record<SlotType, { title: [string, string]; hint: [string, stri
 const EMPTY_FORM = {
   alias: '', display_name: '', description: '', target_model: '', provider: '', adapter: 'openai',
   wire_api: 'chat' as 'chat' | 'responses',
+  inbound_protocol: 'chat_completions' as 'chat_completions' | 'responses',
+  upstream_protocol: 'chat' as 'chat' | 'responses',
   base_url: '', api_key: '', api_key_env: '', use_proxy: false, proxy_url: '', enabled: true, is_multimodal: false,
   is_reasoning_text: false, is_image_gen: false, is_video_gen: false,
   context_window: '', auto_compact_token_limit: '',
@@ -29,9 +31,10 @@ function compatible(slot: SlotType, model: ModelConfig): boolean {
   if (slot === 'image_gen') return model.is_image_gen || Boolean(model.capabilities?.image_generation);
   if (slot === 'video_gen') return model.is_video_gen || Boolean(model.capabilities?.video_generation);
   if (slot === 'vision') return model.is_multimodal || Boolean(model.capabilities?.vision);
-  if (slot === 'responses') return model.wire_api === 'responses';
-  if (slot === 'reasoning_text') return model.wire_api !== 'responses' && (model.is_reasoning_text || Boolean(model.capabilities?.reasoning));
-  return model.wire_api !== 'responses' && !model.is_image_gen && !model.is_video_gen;
+  const upstreamProtocol = model.upstream_protocol || model.wire_api;
+  if (slot === 'responses') return upstreamProtocol === 'responses';
+  if (slot === 'reasoning_text') return upstreamProtocol !== 'responses' && (model.is_reasoning_text || Boolean(model.capabilities?.reasoning));
+  return upstreamProtocol !== 'responses' && !model.is_image_gen && !model.is_video_gen;
 }
 
 const Models: React.FC = () => {
@@ -64,6 +67,8 @@ const Models: React.FC = () => {
       display_name: model.display_name || model.alias,
       description: model.description || '',
       target_model: model.target_model,
+      inbound_protocol: model.inbound_protocol === 'responses' ? 'responses' : 'chat_completions',
+      upstream_protocol: model.upstream_protocol === 'responses' ? 'responses' : model.wire_api === 'responses' ? 'responses' : 'chat',
       provider: model.provider,
       adapter: model.adapter || 'openai',
       wire_api: model.wire_api || 'chat',
@@ -208,7 +213,11 @@ const Models: React.FC = () => {
           <label>{tl(['Provider 名称', 'Provider name'])}<input value={form.provider} onChange={e => setForm({ ...form, provider: e.target.value })} /></label>
           <label>{tl(['上游模型 ID', 'Upstream model ID'])}<input value={form.target_model} onChange={e => setForm({ ...form, target_model: e.target.value })} /></label>
           <label>{tl(['适配器', 'Adapter'])}<input value={form.adapter} onChange={e => setForm({ ...form, adapter: e.target.value })} /></label>
-          <label>{tl(['连接方式', 'Connection API'])}<select value={form.wire_api} onChange={e => setForm({ ...form, wire_api: e.target.value as 'chat' | 'responses' })}>
+          <label>{tl(['入站协议', 'Inbound protocol'])}<select value={form.inbound_protocol} onChange={e => setForm({ ...form, inbound_protocol: e.target.value as 'chat_completions' | 'responses' })}>
+            <option value="chat_completions">WorkBuddy Chat Completions</option>
+            <option value="responses">Responses</option>
+          </select></label>
+          <label>{tl(['上游协议', 'Upstream protocol'])}<select value={form.upstream_protocol} onChange={e => setForm({ ...form, upstream_protocol: e.target.value as 'chat' | 'responses', wire_api: e.target.value as 'chat' | 'responses' })}>
             <option value="chat">Chat Completions</option>
             <option value="responses">Responses</option>
           </select></label>
@@ -221,7 +230,7 @@ const Models: React.FC = () => {
           <label>{tl(['自动压缩阈值（tokens）', 'Auto compact limit (tokens)'])}<input type="number" min="1" value={form.auto_compact_token_limit} onChange={e => setForm({ ...form, auto_compact_token_limit: e.target.value })} placeholder={editing === '__new__' ? tl(['留空使用模型默认值', 'Blank uses the model default']) : `${tl(['默认', 'Default'])} ${tokenLabel(models.find(model => model.alias === editing)?.default_auto_compact_token_limit)}`} /></label>
           <label className="editor-wide">{tl(['说明', 'Description'])}<input value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} /></label>
         </div>
-        <div className="catalog-note">{tl(['代理按模型独立生效；关闭时强制直连，不会继承系统 VPN。国产模型默认关闭。留空时上下文窗口按模型系列使用默认值。', 'Proxy settings apply per model. When disabled, the model connects directly and never inherits the system VPN. Context fields left blank use model-family defaults.'])}</div>
+        <div className="catalog-note">{tl(['入站协议和上游协议必须显式配置；WorkBuddy 适配请选择“Chat Completions → Responses”。代理按模型独立生效；关闭时强制直连。', 'Inbound and upstream protocols are explicit; choose “Chat Completions → Responses” for WorkBuddy. Proxy settings apply per model and are direct when disabled.'])}</div>
         <div className="capability-picker">
           {([['is_reasoning_text', 'Reasoning'], ['is_multimodal', 'Vision'], ['is_image_gen', 'Image generation'], ['is_video_gen', 'Video generation']] as const).map(([key, label]) =>
             <label key={key}><input type="checkbox" checked={form[key]} onChange={e => setForm({ ...form, [key]: e.target.checked })} />{label}</label>)}
@@ -229,6 +238,8 @@ const Models: React.FC = () => {
         <div className="slot-actions">
           <button className="btn btn-primary" onClick={save} disabled={busy === 'save'}>{busy === 'save' ? tl(['保存中...', 'Saving...']) : tl(['保存模型', 'Save model'])}</button>
           <button className="btn" onClick={() => test(form.alias || '__new__', payload())} disabled={Boolean(busy)}>{tl(['测试连接', 'Test connection'])}</button>
+          <button className="btn" onClick={() => test(form.alias || '__new__', { ...payload(), test_mode: 'stream' })} disabled={Boolean(busy)}>{tl(['测试流式', 'Test stream'])}</button>
+          <button className="btn" onClick={() => test(form.alias || '__new__', { ...payload(), test_mode: 'tool_roundtrip' })} disabled={Boolean(busy)}>{tl(['测试工具往返', 'Test tool roundtrip'])}</button>
           <button className="btn btn-ghost" onClick={() => { setEditing(null); setResult(null); }}>{tl(['取消', 'Cancel'])}</button>
         </div>
       </section>}

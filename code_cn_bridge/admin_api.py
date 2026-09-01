@@ -64,6 +64,56 @@ def _edit_config(cfg):
         cfg._data.update(original)
         raise
 
+
+def _model_protocol_fields(
+    data: dict[str, Any],
+    old_entry: dict[str, Any] | None = None,
+    provider: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """Normalize explicit inbound/upstream protocol settings.
+
+    ``wire_api`` remains as a compatibility field for existing configs and
+    callers; the two explicit fields are what the WorkBuddy route uses.
+    """
+    old_entry = old_entry or {}
+    provider = provider or {}
+    legacy_wire = str(
+        data.get("wire_api")
+        or old_entry.get("wire_api")
+        or old_entry.get("protocol")
+        or provider.get("wire_api")
+        or provider.get("protocol")
+        or "chat"
+    ).strip().lower()
+    upstream = str(
+        data.get("upstream_protocol")
+        or old_entry.get("upstream_protocol")
+        or legacy_wire
+    ).strip().lower()
+    if upstream == "openai-responses":
+        upstream = "responses"
+    if upstream not in {"chat", "chat_completions", "responses"}:
+        raise ValueError("upstream_protocol 只支持 chat 或 responses")
+    if upstream == "chat_completions":
+        upstream = "chat"
+
+    inbound = str(
+        data.get("inbound_protocol")
+        or old_entry.get("inbound_protocol")
+        or (
+            "responses"
+            if legacy_wire in {"responses", "openai-responses"} and "upstream_protocol" not in data
+            else "chat_completions"
+        )
+    ).strip().lower()
+    if inbound not in {"chat_completions", "responses"}:
+        raise ValueError("inbound_protocol 只支持 chat_completions 或 responses")
+    return {
+        "inbound_protocol": inbound,
+        "upstream_protocol": upstream,
+        "wire_api": upstream,
+    }
+
 def _require_local_admin(connection: HTTPConnection) -> None:
     """Keep shutdown and configuration mutation endpoints on this machine."""
     host = connection.client.host if connection.client else ""
@@ -212,6 +262,9 @@ async def list_models():
             "provider": "native_codex",
             "adapter": "native_codex",
             "wire_api": "responses",
+            "inbound_protocol": "responses",
+            "upstream_protocol": "responses",
+            "upstream_model": metadata.get("target", alias),
             "route_kind": "native_codex",
             "base_url": "",
             "api_key_env": "",
@@ -229,9 +282,16 @@ async def list_models():
             "available_adapters": reg.list(),
         })
     for alias, entry in mapping.items():
-        target = entry.get("target", alias)
+        entry = entry if isinstance(entry, dict) else {"target": entry}
+        target = entry.get("upstream_model", entry.get("target", alias))
         provider_name = entry.get("provider", "") or _find_provider_for_target(target, providers)
         provider = providers.get(provider_name, {})
+        upstream_protocol = str(entry.get("upstream_protocol") or entry.get("wire_api") or entry.get("protocol") or provider.get("wire_api") or provider.get("protocol") or (
+            "responses" if provider_name.strip().lower() == "deepseek" else "chat"
+        )).strip().lower()
+        inbound_protocol = str(entry.get("inbound_protocol") or (
+            "responses" if upstream_protocol in {"responses", "openai-responses"} else "chat_completions"
+        )).strip().lower()
         context_settings = custom_model_context_settings(alias, entry)
         models.append({
             "alias": alias,
@@ -240,9 +300,10 @@ async def list_models():
             "target_model": target,
             "provider": provider_name or "",
             "adapter": provider.get("adapter", ""),
-            "wire_api": str(entry.get("wire_api") or entry.get("protocol") or provider.get("wire_api") or provider.get("protocol") or (
-                "responses" if provider_name.strip().lower() == "deepseek" else "chat"
-            )).strip().lower(),
+            "wire_api": upstream_protocol,
+            "inbound_protocol": inbound_protocol,
+            "upstream_protocol": upstream_protocol,
+            "upstream_model": entry.get("upstream_model", target),
             "base_url": provider.get("base_url", ""),
             "api_key_env": provider.get("api_key_env", ""),
             "use_proxy": bool(entry.get("use_proxy", False)),
@@ -281,13 +342,17 @@ async def add_model(data: dict):
         return {"error": "启用代理时必须填写代理地址"}, 400
 
     provider_name = data.get("provider", target)
+    try:
+        protocol_fields = _model_protocol_fields(data)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
     with _edit_config(cfg) as config_data:
         # 更新 provider 信息
         providers = config_data.setdefault("providers", {})
         if provider_name not in providers:
             providers[provider_name] = {
                 "adapter": data.get("adapter", provider_name),
-                "wire_api": data.get("wire_api", "chat"),
+                "wire_api": protocol_fields["upstream_protocol"],
                 "base_url": data.get("base_url", ""),
                 "api_key_env": data.get("api_key_env", ""),
                 "enabled": True,
@@ -319,9 +384,10 @@ async def add_model(data: dict):
             "display_name": str(data.get("display_name") or alias).strip(),
             "description": str(data.get("description") or "").strip(),
             "target": target,
+            "upstream_model": target,
             "provider": provider_name,
             "route_kind": "custom",
-            "wire_api": str(data.get("wire_api") or providers[provider_name].get("wire_api") or "chat").strip().lower(),
+            **protocol_fields,
             "enabled": data.get("enabled", True),
             "capabilities": dict(data.get("capabilities") or {}),
             "is_multimodal": data.get("is_multimodal", False),
@@ -357,7 +423,7 @@ async def update_model(alias: str, data: dict):
     if use_proxy and not proxy_url:
         return {"error": "启用代理时必须填写代理地址"}, 400
 
-    target = data.get("target_model", old_target)
+    target = data.get("upstream_model", data.get("target_model", old_target))
     providers = cfg._data.get("providers", {})
     provider_name = data.get("provider", old_entry.get("provider", "") if isinstance(old_entry, dict) else "")
 
@@ -367,6 +433,16 @@ async def update_model(alias: str, data: dict):
         if found:
             provider_name = found
 
+    protocol_provider = dict(providers.get(provider_name, {}))
+    if provider_name.strip().lower() == "deepseek" and not any(
+        old_dict.get(key) for key in ("upstream_protocol", "wire_api", "protocol")
+    ) and not any(data.get(key) for key in ("upstream_protocol", "wire_api", "protocol")):
+        protocol_provider["wire_api"] = "responses"
+    try:
+        protocol_fields = _model_protocol_fields(data, old_dict, protocol_provider)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+
     with _edit_config(cfg) as config_data:
         mapping = config_data.setdefault("model_mapping", {})
         providers = config_data.setdefault("providers", {})
@@ -374,9 +450,10 @@ async def update_model(alias: str, data: dict):
             "display_name": str(data.get("display_name") or old_dict.get("display_name") or alias).strip(),
             "description": str(data.get("description") if "description" in data else old_dict.get("description", "")).strip(),
             "target": target,
+            "upstream_model": target,
             "provider": provider_name,
             "route_kind": "custom",
-            "wire_api": str(data.get("wire_api") or old_dict.get("wire_api") or providers.get(provider_name, {}).get("wire_api") or "chat").strip().lower(),
+            **protocol_fields,
             "enabled": data.get("enabled", old_dict.get("enabled", True)),
             "capabilities": dict(data.get("capabilities") if "capabilities" in data else old_dict.get("capabilities", {})),
             "is_multimodal": data.get("is_multimodal", old_dict.get("is_multimodal", False)),
@@ -439,14 +516,14 @@ async def test_connection(alias: str, data: dict | None = None):
 
     entry = mapping.get(alias, alias)
     if isinstance(entry, dict):
-        target = entry.get("target", alias)
+        target = entry.get("upstream_model", entry.get("target", alias))
         provider_name = entry.get("provider", "") or _find_provider_for_target(target, cfg.providers)
     else:
         target = entry
         provider_name = _find_provider_for_target(target, cfg.providers)
 
     if data:
-        target = str(data.get("target_model") or target).strip()
+        target = str(data.get("upstream_model") or data.get("target_model") or target).strip()
         provider_name = str(data.get("provider") or provider_name or "").strip()
 
     if not provider_name:
@@ -463,6 +540,11 @@ async def test_connection(alias: str, data: dict | None = None):
             provider["adapter"] = data["adapter"]
         if "wire_api" in data:
             model_settings["wire_api"] = data["wire_api"]
+        if "upstream_protocol" in data:
+            model_settings["wire_api"] = data["upstream_protocol"]
+            model_settings["upstream_protocol"] = data["upstream_protocol"]
+        if "inbound_protocol" in data:
+            model_settings["inbound_protocol"] = data["inbound_protocol"]
         if "use_proxy" in data:
             model_settings["use_proxy"] = bool(data["use_proxy"])
         if "proxy_url" in data:
@@ -523,14 +605,30 @@ async def test_connection(alias: str, data: dict | None = None):
     headers = adapter.get_headers(api_key)
 
     if model_uses_responses(provider_name, provider, model_settings):
+        test_mode = str((data or {}).get("test_mode") or "non_stream").strip().lower()
+        if test_mode not in {"non_stream", "stream", "tool_roundtrip"}:
+            return {"status": "error", "message": "test_mode 只支持 non_stream、stream 或 tool_roundtrip"}
         base = adapter.base_url.rstrip("/")
         responses_url = base if base.endswith("/responses") else f"{base}/responses"
         responses_body = {
             "model": target,
             "input": "Reply only OK",
             "max_output_tokens": 8,
-            "stream": False,
+            "stream": test_mode == "stream",
+            "store": False,
         }
+        if test_mode == "tool_roundtrip":
+            responses_body.update({
+                "input": "Call the test function once.",
+                "tools": [{
+                    "type": "function",
+                    "name": "bridge_test_function",
+                    "description": "A harmless connectivity test function.",
+                    "parameters": {"type": "object", "properties": {}},
+                }],
+                "tool_choice": "required",
+                "stream": False,
+            })
         start = time.time()
         try:
             async with make_provider_async_client(
@@ -541,8 +639,62 @@ async def test_connection(alias: str, data: dict | None = None):
                 ),
                 timeout=httpx.Timeout(15),
             ) as client:
+                if test_mode == "stream":
+                    async with client.stream("POST", responses_url, json=responses_body, headers=headers) as resp:
+                        if resp.status_code != 200:
+                            return {
+                                "status": "error",
+                                "elapsed_ms": round((time.time() - start) * 1000, 1),
+                                "message": f"HTTP {resp.status_code}",
+                            }
+                        async for line in resp.aiter_lines():
+                            if line.strip():
+                                return {
+                                    "status": "ok",
+                                    "elapsed_ms": round((time.time() - start) * 1000, 1),
+                                    "message": "Responses 流式连接成功 (首个事件已收到)",
+                                }
+                        return {"status": "error", "message": "Responses 流式连接未返回事件"}
                 resp = await client.post(responses_url, json=responses_body, headers=headers)
                 elapsed = (time.time() - start) * 1000
+                if resp.status_code == 200 and test_mode == "tool_roundtrip":
+                    try:
+                        first_payload = resp.json()
+                        output = first_payload.get("output") if isinstance(first_payload, dict) else []
+                        function_call = next(
+                            item for item in output
+                            if isinstance(item, dict) and item.get("type") == "function_call"
+                        )
+                        call_id = str(function_call.get("call_id") or function_call.get("id") or "")
+                        if not call_id:
+                            raise ValueError("function_call 缺少 call_id")
+                        second_body = {
+                            **responses_body,
+                            "input": [
+                                *([item for item in output if isinstance(item, dict)]),
+                                {"type": "function_call_output", "call_id": call_id, "output": "test function completed"},
+                            ],
+                            "tools": responses_body["tools"],
+                            "tool_choice": "auto",
+                        }
+                        second = await client.post(responses_url, json=second_body, headers=headers)
+                    except (ValueError, StopIteration, TypeError):
+                        return {
+                            "status": "error",
+                            "elapsed_ms": round(elapsed, 1),
+                            "message": "Responses 工具往返测试未返回可配对的 function_call",
+                        }
+                    if second.status_code == 200:
+                        return {
+                            "status": "ok",
+                            "elapsed_ms": round((time.time() - start) * 1000, 1),
+                            "message": "Responses 函数调用往返成功",
+                        }
+                    return {
+                        "status": "error",
+                        "elapsed_ms": round((time.time() - start) * 1000, 1),
+                        "message": f"工具结果回传 HTTP {second.status_code}",
+                    }
                 if resp.status_code == 200:
                     return {
                         "status": "ok",
@@ -552,7 +704,7 @@ async def test_connection(alias: str, data: dict | None = None):
                 return {
                     "status": "error",
                     "elapsed_ms": round(elapsed, 1),
-                    "message": f"HTTP {resp.status_code}: {resp.text[:200]}",
+                    "message": f"HTTP {resp.status_code}",
                 }
         except httpx.TimeoutException:
             return {"status": "error", "message": "Responses 连接超时（15秒）"}
@@ -651,14 +803,14 @@ def _inferred_slot_alias(slot_id: str, mapping: dict) -> str:
             return alias
         if slot_id == "video_gen" and entry.get("is_video_gen", False):
             return alias
-        if slot_id == "responses" and entry.get("wire_api") == "responses":
+        if slot_id == "responses" and (entry.get("upstream_protocol") or entry.get("wire_api")) == "responses":
             return alias
         if slot_id == "text" and not any(
             entry.get(flag, False)
             for flag in ("is_multimodal", "is_image_gen", "is_video_gen")
-        ) and not entry.get("is_reasoning_text") and entry.get("wire_api", "chat") != "responses":
+        ) and not entry.get("is_reasoning_text") and (entry.get("upstream_protocol") or entry.get("wire_api", "chat")) != "responses":
             return alias
-        if slot_id == "reasoning_text" and entry.get("is_reasoning_text", False) and entry.get("wire_api", "chat") != "responses":
+        if slot_id == "reasoning_text" and entry.get("is_reasoning_text", False) and (entry.get("upstream_protocol") or entry.get("wire_api", "chat")) != "responses":
             return alias
     return preferred
 
@@ -674,7 +826,7 @@ def _slot_payload(slot_id: str, cfg) -> dict:
     if not provider_name and target:
         provider_name = _find_provider_for_target(target, cfg.providers) or ""
     provider = cfg.providers.get(provider_name, {})
-    wire_api = str(entry.get("wire_api") or provider.get("wire_api") or "chat").strip().lower()
+    wire_api = str(entry.get("upstream_protocol") or entry.get("wire_api") or provider.get("wire_api") or "chat").strip().lower()
     return {
         "slot_id": slot_id,
         "alias": alias,
@@ -1638,6 +1790,7 @@ async def codex_switch_to_official():
     TOML still falls back to the minimal emergency config; the writer keeps a
     complete backup before either replacement.
     """
+    process = _codex_desktop_process()
     try:
         lines = _read_toml_lines(_CODEX_TOML)
         tomllib.loads("\n".join(lines))
@@ -1662,15 +1815,26 @@ async def codex_switch_to_official():
         preserved_settings = True
 
     _write_toml_lines(_CODEX_TOML, lines)
+    catalog_path = get_model_catalog_target_path()
+    try:
+        catalog_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("删除 Bridge 模型目录失败，Codex 重启后仍会忽略该目录: %s", exc)
+
+    _stop_codex_desktop(process)
+    _restart_codex_after_response(process)
+    restarted = process is not None
     return {
         "status": "ok",
         "message": (
-            "已恢复官方直连并保留 MCP、项目、插件等用户配置。重新加载 Codex 后生效。"
+            "已恢复官方直连并清理 Bridge 模型目录；Codex 正在重新启动。"
+            if preserved_settings and restarted
+            else "已恢复官方直连并清理 Bridge 模型目录；请重新启动 Codex 后生效。"
             if preserved_settings
-            else "原 Codex 配置无法解析，已备份并恢复最小官方直连。重新加载 Codex 后生效。"
+            else "原 Codex 配置无法解析，已备份并恢复最小官方直连。"
         ),
         "using_bridge": False,
-        "codex_restarted": False,
+        "codex_restarted": restarted,
         "official_proxy_url": "",
         "preserved_settings": preserved_settings,
     }

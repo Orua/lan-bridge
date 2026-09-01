@@ -9,6 +9,20 @@ from typing import Any, Literal
 RouteKind = Literal["native_codex", "custom"]
 
 
+def is_chat_to_responses_mapping(entry: dict[str, Any] | None) -> bool:
+    """Return true only for an explicitly configured WorkBuddy bridge route."""
+    if not isinstance(entry, dict) or not entry.get("enabled", True):
+        return False
+    inbound = str(entry.get("inbound_protocol") or "").strip().lower()
+    upstream = str(
+        entry.get("upstream_protocol")
+        or entry.get("wire_api")
+        or entry.get("protocol")
+        or ""
+    ).strip().lower()
+    return inbound == "chat_completions" and upstream in {"responses", "openai-responses"}
+
+
 @dataclass(frozen=True)
 class Route:
     kind: RouteKind
@@ -72,7 +86,7 @@ def resolve_route(config, model: str) -> Route:
 
     entry = getattr(config, "model_mapping", {}).get(requested)
     if isinstance(entry, dict) and entry.get("enabled", True):
-        target = str(entry.get("target") or requested)
+        target = str(entry.get("upstream_model") or entry.get("target") or requested)
         if _is_native_mapping(entry):
             return Route(
                 kind="native_codex",
@@ -104,7 +118,7 @@ def resolve_route(config, model: str) -> Route:
         return Route(
             kind="native_codex",
             requested_model=requested,
-            target_model=str(metadata.get("target") or requested),
+            target_model=str(metadata.get("upstream_model") or metadata.get("target") or requested),
             provider="native_codex",
             adapter="native_codex",
             auth_mode="host_login",

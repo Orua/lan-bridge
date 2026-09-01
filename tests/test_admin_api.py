@@ -125,10 +125,14 @@ class CodexSwitchTests(unittest.TestCase):
             'trust_level = "trusted"\n',
             encoding="utf-8",
         )
+        process = (123, r"C:\Program Files\WindowsApps\OpenAI.Codex_test\app\Codex.exe")
+        self.catalog_path.write_text('{"models": []}', encoding="utf-8")
         with patch.object(admin_api, "_CODEX_TOML", self.toml_path), patch.object(
             admin_api, "get_config", return_value=self._config("http://127.0.0.1:7890")
         ), patch.object(
-            admin_api, "_codex_desktop_process"
+            admin_api, "get_model_catalog_target_path", return_value=self.catalog_path
+        ), patch.object(
+            admin_api, "_codex_desktop_process", return_value=process
         ), patch.object(
             admin_api, "_stop_codex_desktop"
         ) as stop, patch.object(
@@ -148,13 +152,14 @@ class CodexSwitchTests(unittest.TestCase):
         self.assertNotIn("model_auto_compact_token_limit =", content)
         self.assertNotIn("tool_output_token_limit =", content)
         self.assertNotIn("enable_request_compression", content)
-        self.assertFalse(response["codex_restarted"])
-        self.assertIn("保留 MCP", response["message"])
+        self.assertTrue(response["codex_restarted"])
+        self.assertIn("正在重新启动", response["message"])
         self.assertTrue(response["preserved_settings"])
         self.assertEqual(response["official_proxy_url"], "")
         self.assertEqual(len(list((self.toml_path.parent / "backups").glob("config.toml.*.bak"))), 1)
-        stop.assert_not_called()
-        restart.assert_not_called()
+        self.assertFalse(self.catalog_path.exists())
+        stop.assert_called_once_with(process)
+        restart.assert_called_once_with(process)
 
     def test_enable_unified_removes_proxy_without_touching_desktop_process(self):
         self.toml_path.write_text(
@@ -622,11 +627,14 @@ class CodexSwitchTests(unittest.TestCase):
         self.assertEqual(command[0], "explorer.exe")
         self.assertEqual(command[1], r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App")
 
-    def test_restore_official_never_attempts_process_control(self):
+    def test_restore_official_restarts_codex_to_drop_stale_custom_models(self):
+        process = (123, r"C:\Program Files\WindowsApps\OpenAI.Codex_test\app\Codex.exe")
         with patch.object(admin_api, "_CODEX_TOML", self.toml_path), patch.object(
             admin_api, "get_config", return_value=self._config("http://127.0.0.1:19828")
         ), patch.object(
-            admin_api, "_codex_desktop_process"
+            admin_api, "get_model_catalog_target_path", return_value=self.catalog_path
+        ), patch.object(
+            admin_api, "_codex_desktop_process", return_value=process
         ), patch.object(
             admin_api, "_stop_codex_desktop"
         ) as stop, patch.object(
@@ -639,8 +647,9 @@ class CodexSwitchTests(unittest.TestCase):
         content = self.toml_path.read_text(encoding="utf-8")
         self.assertNotIn("proxy_url", content)
         self.assertFalse(response["using_bridge"])
-        stop.assert_not_called()
-        restart.assert_not_called()
+        self.assertTrue(response["codex_restarted"])
+        stop.assert_called_once_with(process)
+        restart.assert_called_once_with(process)
 
     def test_restore_official_recovers_from_malformed_toml(self):
         self.toml_path.write_text(
@@ -649,6 +658,10 @@ class CodexSwitchTests(unittest.TestCase):
         )
         with patch.object(admin_api, "_CODEX_TOML", self.toml_path), patch.object(
             admin_api, "get_config", return_value=self._config("http://bad.invalid")
+        ), patch.object(
+            admin_api, "get_model_catalog_target_path", return_value=self.catalog_path
+        ), patch.object(
+            admin_api, "_codex_desktop_process", return_value=None
         ):
             response = asyncio.run(admin_api.codex_switch_to_official())
 
@@ -664,7 +677,11 @@ class CodexSwitchTests(unittest.TestCase):
         original = b'\xff\xfemodel_provider = "custom"\n'
         self.toml_path.write_bytes(original)
 
-        with patch.object(admin_api, "_CODEX_TOML", self.toml_path):
+        with patch.object(admin_api, "_CODEX_TOML", self.toml_path), patch.object(
+            admin_api, "get_model_catalog_target_path", return_value=self.catalog_path
+        ), patch.object(
+            admin_api, "_codex_desktop_process", return_value=None
+        ):
             response = asyncio.run(admin_api.codex_switch_to_official())
 
         self.assertEqual(response["status"], "ok")
@@ -688,7 +705,11 @@ class CodexSwitchTests(unittest.TestCase):
         self.assertEqual(list(self.toml_path.parent.glob(".config.toml.*.tmp")), [])
 
     def test_toml_backup_retention_is_bounded(self):
-        with patch.object(admin_api, "_CODEX_TOML", self.toml_path):
+        with patch.object(admin_api, "_CODEX_TOML", self.toml_path), patch.object(
+            admin_api, "get_model_catalog_target_path", return_value=self.catalog_path
+        ), patch.object(
+            admin_api, "_codex_desktop_process", return_value=None
+        ):
             for index in range(admin_api._CODEX_CONFIG_BACKUP_LIMIT + 3):
                 self.toml_path.write_text(f'model_provider = "custom-{index}"\n', encoding="utf-8")
                 asyncio.run(admin_api.codex_switch_to_official())

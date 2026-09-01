@@ -19,9 +19,12 @@ export interface ModelConfig {
   display_name: string;
   description: string;
   target_model: string;
+  upstream_model?: string;
   provider: string;
   adapter: string;
   wire_api: 'chat' | 'responses';
+  inbound_protocol?: 'chat_completions' | 'responses' | string;
+  upstream_protocol?: 'chat' | 'responses' | string;
   route_kind: 'native_codex' | 'custom';
   read_only: boolean;
   capabilities: Record<string, unknown>;

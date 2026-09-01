@@ -24,6 +24,42 @@ def _payloads(events: list[str]) -> list[dict]:
 
 
 class StabilityUpgradeTests(unittest.TestCase):
+    def test_stream_failure_is_contained_after_response_headers(self):
+        import asyncio
+
+        async def broken_stream():
+            yield b"data: first\n\n"
+            raise RuntimeError("simulated stream failure")
+
+        async def consume():
+            response = server.StreamingResponse(broken_stream())
+            bound = server._bind_stream_principal(response, server.ANONYMOUS_PRINCIPAL)
+            return [chunk async for chunk in bound.body_iterator]
+
+        with self.assertLogs("lan-bridge", level="ERROR") as captured:
+            chunks = asyncio.run(consume())
+
+        self.assertEqual(chunks, [b"data: first\n\n"])
+        self.assertTrue(any("服务继续运行" in line for line in captured.output))
+
+    def test_stream_finalization_from_another_task_never_raises(self):
+        import asyncio
+
+        async def one_chunk():
+            yield b"data: first\n\n"
+            await asyncio.sleep(60)
+
+        async def exercise_cross_context_close():
+            response = server.StreamingResponse(one_chunk())
+            bound = server._bind_stream_principal(response, server.ANONYMOUS_PRINCIPAL)
+            iterator = bound.body_iterator
+            first = await asyncio.create_task(anext(iterator))
+            await asyncio.create_task(iterator.aclose())
+            return first
+
+        first = asyncio.run(exercise_cross_context_close())
+        self.assertEqual(first, b"data: first\n\n")
+
     def test_config_reload_if_changed_keeps_last_valid_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.yaml"
@@ -276,6 +312,33 @@ class StabilityUpgradeTests(unittest.TestCase):
         self.assertNotIn("SECRET-ARGS", rendered)
         self.assertNotIn("SECRET-REASONING", rendered)
         self.assertIn("deepseek-v4-pro", rendered)
+
+    def test_debug_logging_suppresses_secret_bearing_httpcore_headers(self):
+        httpcore_logger = logging.getLogger("httpcore")
+        httpx_logger = logging.getLogger("httpx")
+        original_httpcore_level = httpcore_logger.level
+        original_httpx_level = httpx_logger.level
+        project_logger = logging.getLogger("lan-bridge")
+        process_logger = logging.getLogger()
+        original_project_handlers = list(project_logger.handlers)
+        original_process_handlers = list(process_logger.handlers)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, {"LAN_BRIDGE_LOG_DIR": temp_dir}
+        ):
+            try:
+                server._setup_logging(verbose=True)
+                self.assertEqual(httpcore_logger.level, logging.WARNING)
+                self.assertEqual(httpx_logger.level, logging.INFO)
+            finally:
+                for logger in (project_logger, process_logger):
+                    for handler in list(logger.handlers):
+                        if handler not in original_project_handlers and handler not in original_process_handlers:
+                            logger.removeHandler(handler)
+                            handler.close()
+                project_logger.handlers = original_project_handlers
+                process_logger.handlers = original_process_handlers
+                httpcore_logger.setLevel(original_httpcore_level)
+                httpx_logger.setLevel(original_httpx_level)
 
     def test_tool_summaries_are_bounded(self):
         responses_tools = [

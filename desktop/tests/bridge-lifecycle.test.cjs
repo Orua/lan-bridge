@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  bridgeRestartDelayMs,
   readServerBooleanSetting,
   shouldRecoverUnownedBridge,
   shouldRestartBridge,
@@ -34,13 +35,19 @@ test('an unrequested clean exit is restarted', () => {
   }), true);
 });
 
-test('restart budget is bounded', () => {
+test('restart remains enabled after the former retry limit', () => {
   assert.equal(shouldRestartBridge({
     desiredRunning: true,
     isQuitting: false,
     restartCount: 5,
     maxRestarts: 5,
-  }), false);
+  }), true);
+});
+
+test('restart backoff is bounded without giving up', () => {
+  assert.equal(bridgeRestartDelayMs(0), 1000);
+  assert.equal(bridgeRestartDelayMs(3), 8000);
+  assert.equal(bridgeRestartDelayMs(100), 30000);
 });
 
 test('desktop lifecycle settings are read from the server mapping', () => {

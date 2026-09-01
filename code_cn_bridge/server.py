@@ -22,6 +22,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import httpx
 import zstandard as zstd
@@ -50,12 +51,16 @@ from .native_proxy import (
     proxy_native_responses,
 )
 from .provider_proxy import (
+    ChatToResponsesHTTPError,
     ProviderResponsesHTTPError,
     model_uses_responses,
     provider_uses_responses,
+    proxy_chat_to_native_responses,
+    proxy_chat_to_responses,
     proxy_provider_responses,
 )
-from .routing import resolve_route
+from .protocol_adapters import ChatToResponsesConversionError, ResponsesToChatConversionError
+from .routing import is_chat_to_responses_mapping, resolve_route
 from .middleware import (
     ErrorHandlingMiddleware,
     RequestLoggingMiddleware,
@@ -116,9 +121,28 @@ def _bind_stream_principal(response, principal: BridgePrincipal):
     original_iterator = response.body_iterator
 
     async def body_iterator():
-        with bridge_principal_context(principal):
-            async for chunk in original_iterator:
-                yield chunk
+        try:
+            with bridge_principal_context(principal):
+                async for chunk in original_iterator:
+                    yield chunk
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnects are expected during streaming. Do not let
+            # cancellation escape as a background task failure.
+            return
+        except Exception:
+            # Streaming happens after ordinary HTTP middleware has returned,
+            # so this is the final request-level containment boundary.
+            logger.exception("流式响应处理失败；本次请求已终止，服务继续运行")
+            return
+        finally:
+            close = getattr(original_iterator, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except (asyncio.CancelledError, GeneratorExit):
+                    pass
+                except Exception:
+                    logger.exception("关闭异常流式响应失败；服务继续运行")
 
     response.body_iterator = body_iterator()
     return response
@@ -2424,6 +2448,12 @@ def _setup_logging(verbose: bool = False) -> None:
         root.warning("无法启用文件日志，继续使用控制台日志: %s", exc)
 
     root_logger.setLevel(level)
+    # httpcore DEBUG records include complete response headers, which can hold
+    # cookies and turn-state tokens. Keep transport internals quiet even when
+    # LAN BRIDGE itself is in debug mode; httpx INFO still records method/URL
+    # and status without secret-bearing headers.
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.INFO if verbose else logging.WARNING)
 
 def _get_adapter_for_model(model: str) -> tuple[BaseAdapter, str, str, str]:
     """根据 code 模型名查找适配器
@@ -4632,11 +4662,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions_endpoint(request: Request):
-        """透传 Chat Completions 请求：读 JSON -> 检测图片 -> 视觉/文本路由 -> 转发上游。
-
-        不做嵌套 HTTP 解包，不复用 Responses 视觉路由；WorkBuddy 的 chat
-        请求当作普通 OpenAI 兼容 Chat 请求直接转发。
-        """
+        """Serve Chat clients through either Chat or explicitly resolved Responses routes."""
         start_time = time.time()
         request_id = uuid.uuid4().hex[:12]
         try:
@@ -4673,6 +4699,242 @@ def create_app(verbose: bool = False) -> FastAPI:
             request=_audit_chat_request_summary(body),
             text_distribution=_chat_text_distribution(body),
         )
+
+        cfg = get_config()
+        route = resolve_route(cfg, model)
+        model_entry = cfg.model_mapping.get(model)
+        if isinstance(model_entry, dict) and not model_entry.get("enabled", True):
+            message = f"模型别名已禁用: {model}"
+            _audit_event("chat.route_error", request_id, model=model, error="model_disabled")
+            _record_request(start_time, model, "chat", 400, bool(stream), message, provider="", target_model="")
+            return JSONResponse(content=build_error_response(message, "model_disabled", 400), status_code=400)
+
+        if route.kind == "native_codex":
+            target_model = route.target_model
+            _audit_event(
+                "chat.responses_routed",
+                request_id,
+                inbound_protocol="chat_completions",
+                upstream_protocol="responses",
+                requested_model=model,
+                upstream_model=target_model,
+                provider="native_codex",
+                stream=bool(stream),
+                has_images=_chat_has_images(body),
+                tool_count=len(body.get("tools") or []) if isinstance(body.get("tools"), list) else 0,
+            )
+            native_recorded = False
+
+            def trace_native_chat(event: str, fields: dict[str, Any]) -> None:
+                nonlocal native_recorded
+                trace_fields = dict(fields)
+                if event == "stream_finished" and not native_recorded:
+                    native_recorded = True
+                    status = 502 if trace_fields.get("failed") else 200 if trace_fields.get("completed") else 499
+                    _record_request(
+                        start_time,
+                        model,
+                        "chat",
+                        status,
+                        True,
+                        "" if status == 200 else "Native Responses stream ended before completion",
+                        int(trace_fields.get("tokens") or 0),
+                        provider="native_codex",
+                        target_model=target_model,
+                        upstream_api="responses",
+                    )
+                _audit_event(f"chat.responses_{event}", request_id, **trace_fields)
+
+            try:
+                response = await proxy_chat_to_native_responses(
+                    request,
+                    body,
+                    model,
+                    target_model,
+                    cfg,
+                    model_entry=dict(route.metadata),
+                    request_id=request_id,
+                    access_key_id=principal.key_id,
+                    on_trace=trace_native_chat,
+                )
+                if not isinstance(response, StreamingResponse):
+                    native_recorded = True
+                    response_tokens = 0
+                    try:
+                        response_payload = json.loads(response.body or b"{}")
+                        response_tokens = int((response_payload.get("usage") or {}).get("total_tokens") or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    _record_request(
+                        start_time,
+                        model,
+                        "chat",
+                        response.status_code,
+                        False,
+                        "",
+                        response_tokens,
+                        provider="native_codex",
+                        target_model=target_model,
+                        upstream_api="responses",
+                    )
+                return _bind_stream_principal(response, principal)
+            except ChatToResponsesConversionError as exc:
+                message = str(exc)
+                _audit_event("chat.responses_conversion_error", request_id, model=model, error=message)
+                _record_request(start_time, model, "chat", exc.status_code, bool(stream), message, provider="native_codex", target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, exc.code, exc.status_code), status_code=exc.status_code)
+            except ResponsesToChatConversionError:
+                message = f"原生 Responses 上游返回了无法转换的响应（request_id={request_id}）"
+                _audit_event("chat.responses_conversion_error", request_id, model=model, error="invalid_native_response_shape")
+                _record_request(start_time, model, "chat", 502, bool(stream), message, provider="native_codex", target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", 502), status_code=502)
+            except NativeUpstreamHTTPError as exc:
+                message = f"Native Responses upstream rejected the request (HTTP {exc.status_code}, request_id={request_id})"
+                _audit_event("chat.responses_upstream_error", request_id, model=model, status=exc.status_code)
+                _record_request(start_time, model, "chat", exc.status_code, bool(stream), message, provider="native_codex", target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", exc.status_code), status_code=exc.status_code)
+            except httpx.TimeoutException:
+                message = f"Native Responses upstream timed out (request_id={request_id})"
+                _audit_event("chat.responses_timeout", request_id, model=model)
+                _record_request(start_time, model, "chat", 504, bool(stream), message, provider="native_codex", target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_timeout", 504), status_code=504)
+            except Exception as exc:
+                message = f"Native Responses request failed (request_id={request_id})"
+                logger.exception("Native Chat-to-Responses 请求处理异常")
+                _audit_event("chat.responses_failed", request_id, model=model, error=type(exc).__name__)
+                _record_request(start_time, model, "chat", 502, bool(stream), message, provider="native_codex", target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", 502), status_code=502)
+
+        if is_chat_to_responses_mapping(model_entry):
+            if route.provider in {"", "unknown"}:
+                message = f"未找到模型 '{model}' 的 Responses provider 配置"
+                _audit_event("chat.responses_route_error", request_id, model=model, error="provider_not_found")
+                _record_request(start_time, model, "chat", 400, bool(stream), message, provider="", target_model="")
+                return JSONResponse(content=build_error_response(message, "model_route_not_found", 400), status_code=400)
+
+            capabilities = model_entry.get("capabilities") if isinstance(model_entry.get("capabilities"), dict) else {}
+            if _chat_has_images(body) and not bool(capabilities.get("image_input", model_entry.get("is_multimodal", False))):
+                message = f"模型 '{model}' 未启用图片输入能力"
+                _audit_event("chat.responses_route_error", request_id, model=model, error="image_input_unsupported")
+                _record_request(start_time, model, "chat", 400, bool(stream), message, provider=route.provider, target_model=route.target_model)
+                return JSONResponse(content=build_error_response(message, "image_input_unsupported", 400), status_code=400)
+
+            try:
+                adapter, provider_name, target_model, api_key = _resolve_adapter(route.provider, route.target_model)
+            except ValueError as exc:
+                message = str(exc)
+                _audit_event("chat.responses_route_error", request_id, model=model, error="adapter_unavailable")
+                _record_request(start_time, model, "chat", 400, bool(stream), message, provider=route.provider, target_model=route.target_model)
+                return JSONResponse(content=build_error_response(message, "model_route_not_found", 400), status_code=400)
+
+            _audit_event(
+                "chat.responses_routed",
+                request_id,
+                inbound_protocol="chat_completions",
+                upstream_protocol="responses",
+                requested_model=model,
+                upstream_model=target_model,
+                provider=provider_name,
+                stream=bool(stream),
+                has_images=_chat_has_images(body),
+                tool_count=len(body.get("tools") or []) if isinstance(body.get("tools"), list) else 0,
+            )
+            responses_provider = dict(cfg.get_provider(provider_name) or {})
+            responses_provider["wire_api"] = "responses"
+            responses_recorded = False
+
+            def trace_chat_responses(event: str, fields: dict[str, Any]) -> None:
+                nonlocal responses_recorded
+                trace_fields = dict(fields)
+                if event == "stream_finished" and not responses_recorded:
+                    responses_recorded = True
+                    status = 502 if trace_fields.get("failed") else 200 if trace_fields.get("completed") else 499
+                    _record_request(
+                        start_time,
+                        model,
+                        "chat",
+                        status,
+                        True,
+                        "" if status == 200 else "Responses upstream stream ended before completion",
+                        int(trace_fields.get("tokens") or 0),
+                        provider=provider_name,
+                        target_model=target_model,
+                        upstream_api="responses",
+                    )
+                _audit_event(f"chat.responses_{event}", request_id, **trace_fields)
+
+            try:
+                response = await proxy_chat_to_responses(
+                    body,
+                    model,
+                    target_model,
+                    provider_name,
+                    responses_provider,
+                    adapter,
+                    api_key,
+                    model_entry=model_entry,
+                    proxy_url=_model_proxy_url(
+                        cfg,
+                        alias=model,
+                        provider_name=provider_name,
+                        target_model=target_model,
+                    ),
+                    request_id=request_id,
+                    on_trace=trace_chat_responses,
+                )
+                if not isinstance(response, StreamingResponse):
+                    responses_recorded = True
+                    response_tokens = 0
+                    try:
+                        response_payload = json.loads(response.body or b"{}")
+                        response_tokens = int((response_payload.get("usage") or {}).get("total_tokens") or 0)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                    _record_request(
+                        start_time,
+                        model,
+                        "chat",
+                        response.status_code,
+                        False,
+                        "",
+                        response_tokens,
+                        provider=provider_name,
+                        target_model=target_model,
+                        upstream_api="responses",
+                    )
+                return _bind_stream_principal(response, principal)
+            except ChatToResponsesConversionError as exc:
+                message = str(exc)
+                _audit_event("chat.responses_conversion_error", request_id, model=model, error=message)
+                _record_request(start_time, model, "chat", exc.status_code, bool(stream), message, provider=provider_name, target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, exc.code, exc.status_code), status_code=exc.status_code)
+            except ResponsesToChatConversionError:
+                message = f"Responses 上游返回了无法转换的响应（request_id={request_id}）"
+                _audit_event("chat.responses_conversion_error", request_id, model=model, error="invalid_response_shape")
+                _record_request(start_time, model, "chat", 502, bool(stream), message, provider=provider_name, target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", 502), status_code=502)
+            except ChatToResponsesHTTPError as exc:
+                message = f"Responses upstream rejected the request (HTTP {exc.status_code}, request_id={request_id})"
+                _audit_event("chat.responses_upstream_error", request_id, model=model, status=exc.status_code)
+                _record_request(start_time, model, "chat", exc.status_code, bool(stream), message, provider=provider_name, target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", exc.status_code), status_code=exc.status_code)
+            except httpx.TimeoutException:
+                message = f"Responses upstream timed out (request_id={request_id})"
+                _audit_event("chat.responses_timeout", request_id, model=model)
+                _record_request(start_time, model, "chat", 504, bool(stream), message, provider=provider_name, target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_timeout", 504), status_code=504)
+            except Exception as exc:
+                message = str(exc)
+                logger.exception("Chat-to-Responses 请求处理异常")
+                _audit_event("chat.responses_failed", request_id, model=model, error=message)
+                _record_request(start_time, model, "chat", 502, bool(stream), message, provider=provider_name, target_model=target_model, upstream_api="responses")
+                return JSONResponse(content=build_error_response(message, "responses_upstream_error", 502), status_code=502)
+
+        if route.provider == "unknown":
+            message = f"未知模型别名: {model}"
+            _audit_event("chat.route_error", request_id, model=model, error="model_not_found")
+            _record_request(start_time, model, "chat", 400, bool(stream), message, provider="unknown", target_model=model)
+            return JSONResponse(content=build_error_response(message, "model_not_found", 400), status_code=400)
 
         try:
             adapter, provider_name, target_model, api_key = _chat_route_vision(model, body, request_id)

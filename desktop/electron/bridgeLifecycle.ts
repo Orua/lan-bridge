@@ -11,7 +11,16 @@ export interface BridgeRestartState {
  * explicitly so a graceful exit can never race into an unwanted restart.
  */
 export function shouldRestartBridge(state: BridgeRestartState): boolean {
-  return state.desiredRunning && !state.isQuitting && state.restartCount < state.maxRestarts;
+  return state.desiredRunning && !state.isQuitting;
+}
+
+/**
+ * Keep retrying forever, but cap the retry delay so a crash loop cannot spin
+ * aggressively or permanently disable the service.
+ */
+export function bridgeRestartDelayMs(restartCount: number, maxBackoffStep = 5): number {
+  const step = Math.max(0, Math.min(Math.trunc(restartCount), maxBackoffStep));
+  return Math.min(30_000, 1_000 * (2 ** step));
 }
 
 export function shouldRecoverUnownedBridge(state: {

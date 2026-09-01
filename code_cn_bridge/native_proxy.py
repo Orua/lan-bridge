@@ -1004,6 +1004,30 @@ async def fetch_merged_models(request: Request, config) -> Response:
                 headers=headers,
                 media_type="application/json",
             )
+        custom_aliases = {
+            str(alias)
+            for alias, entry in getattr(config, "model_mapping", {}).items()
+            if isinstance(entry, dict) and entry.get("enabled", True)
+        }
+        if custom_aliases:
+            # WorkBuddy and ordinary OpenAI clients still need the configured
+            # custom aliases when the optional native catalog is unavailable.
+            # Do not invent native entries in this fallback; those require the
+            # host's native login and remain absent until the catalog is live.
+            fallback = merge_model_catalog({"models": []}, config)
+            fallback["models"] = [
+                model for model in fallback.get("models", [])
+                if str(model.get("slug") or "") in custom_aliases
+            ]
+            fallback = add_openai_model_list(fallback)
+            headers = _response_headers(upstream.headers)
+            headers.pop("content-type", None)
+            return Response(
+                content=json.dumps(fallback, ensure_ascii=False, separators=(",", ":")),
+                status_code=200,
+                headers=headers,
+                media_type="application/json",
+            )
         return Response(
             content=upstream.content,
             status_code=upstream.status_code,

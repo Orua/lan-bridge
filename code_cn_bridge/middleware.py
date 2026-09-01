@@ -48,7 +48,15 @@ def bridge_principal_context(principal: BridgePrincipal):
     try:
         yield
     finally:
-        _current_bridge_principal.reset(token)
+        try:
+            _current_bridge_principal.reset(token)
+        except ValueError:
+            # Starlette can finalize a disconnected streaming iterator in a
+            # different asyncio context. Resetting a token across contexts
+            # raises ValueError; contain it so a client disconnect can never
+            # become an unhandled task exception.
+            _current_bridge_principal.set(ANONYMOUS_PRINCIPAL)
+            logger.warning("流式请求已在不同异步上下文中结束，访问主体已安全清理")
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):

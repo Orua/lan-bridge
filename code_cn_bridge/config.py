@@ -349,6 +349,7 @@ class Config:
             if isinstance(entry, str):
                 normalized[alias] = {
                     "target": entry,
+                    "upstream_model": entry,
                     "provider": "",
                     "enabled": True,
                     "is_multimodal": False,
@@ -360,6 +361,29 @@ class Config:
                     "is_reasoning_text": False,
                 }
             elif isinstance(entry, dict):
+                explicit_protocol = bool(
+                    entry.get("upstream_protocol")
+                    or entry.get("wire_api")
+                    or entry.get("protocol")
+                )
+                legacy_protocol = str(
+                    entry.get("upstream_protocol")
+                    or entry.get("wire_api")
+                    or entry.get("protocol")
+                    or ""
+                ).strip().lower()
+                if "target" not in entry and entry.get("upstream_model"):
+                    entry["target"] = entry["upstream_model"]
+                entry.setdefault("upstream_model", entry.get("target", alias))
+                if legacy_protocol:
+                    entry.setdefault(
+                        "inbound_protocol",
+                        "responses" if legacy_protocol in {"responses", "openai-responses"} else "chat_completions",
+                    )
+                if legacy_protocol:
+                    entry.setdefault("upstream_protocol", legacy_protocol)
+                if explicit_protocol and "wire_api" not in entry and entry.get("upstream_protocol") in {"chat", "responses"}:
+                    entry["wire_api"] = entry["upstream_protocol"]
                 entry.setdefault("display_name", alias)
                 entry.setdefault("route_kind", "custom")
                 entry.setdefault("provider", "")

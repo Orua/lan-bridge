@@ -1,10 +1,12 @@
 ﻿import { app, BrowserWindow, Tray, Menu, nativeImage, ipcMain, dialog, shell } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
+import { crashReporter } from 'electron';
 import http from 'http';
 import net from 'net';
 import path from 'path';
 import fs from 'fs';
 import {
+  bridgeRestartDelayMs,
   readServerBooleanSetting,
   shouldRecoverUnownedBridge,
   shouldRestartBridge,
@@ -23,14 +25,70 @@ let bridgeRestartTimer: NodeJS.Timeout | null = null;
 let bridgeStableTimer: NodeJS.Timeout | null = null;
 let bridgeWatchdogTimer: NodeJS.Timeout | null = null;
 let bridgeWatchdogChecking = false;
+let bridgeHealthFailureCount = 0;
 const MAX_RESTART = 5;
 const STARTUP_HEALTH_TIMEOUT_MS = 30_000;
 const STABLE_RUN_RESET_MS = 30_000;
 
 const BRIDGE_PORT = 8765;
 const isDev = !app.isPackaged;
+const DESKTOP_LOG_PATH = path.join(app.getPath('logs'), 'main.log');
+const DESKTOP_LOG_MAX_BYTES = 2 * 1024 * 1024;
 
-if (!app.requestSingleInstanceLock()) {
+function formatError(value: unknown): string {
+  if (value instanceof Error) return value.stack || value.message;
+  return String(value);
+}
+
+function writeDesktopLog(level: 'INFO' | 'WARN' | 'ERROR' | 'FATAL', message: string, detail?: unknown): void {
+  try {
+    fs.mkdirSync(path.dirname(DESKTOP_LOG_PATH), { recursive: true });
+    if (fs.existsSync(DESKTOP_LOG_PATH) && fs.statSync(DESKTOP_LOG_PATH).size >= DESKTOP_LOG_MAX_BYTES) {
+      const rotated = `${DESKTOP_LOG_PATH}.1`;
+      if (fs.existsSync(rotated)) fs.unlinkSync(rotated);
+      fs.renameSync(DESKTOP_LOG_PATH, rotated);
+    }
+    const suffix = detail === undefined ? '' : `\n${formatError(detail)}`;
+    fs.appendFileSync(
+      DESKTOP_LOG_PATH,
+      `${new Date().toISOString()} [${level}] ${message}${suffix}\n`,
+      'utf-8',
+    );
+  } catch {
+    // Diagnostics must never be able to terminate the desktop supervisor.
+  }
+}
+
+function safeSend(channel: string, payload: unknown): void {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return;
+    mainWindow.webContents.send(channel, payload);
+  } catch (error) {
+    writeDesktopLog('ERROR', `向渲染进程发送 ${channel} 失败；主进程继续运行`, error);
+  }
+}
+
+try {
+  crashReporter.start({ uploadToServer: false, compress: false });
+} catch (error) {
+  writeDesktopLog('ERROR', '无法启动 Electron 崩溃转储记录', error);
+}
+
+process.on('uncaughtException', (error, origin) => {
+  writeDesktopLog('FATAL', `Electron 主进程未捕获异常 (${origin})；已阻止进程退出`, error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  writeDesktopLog('ERROR', 'Electron 主进程未处理的 Promise 拒绝；已阻止进程退出', reason);
+});
+
+process.on('exit', (code) => {
+  writeDesktopLog('WARN', `Electron 主进程退出，exit_code=${code}, intentional=${isQuitting}`);
+});
+
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  writeDesktopLog('INFO', '检测到已有 LAN BRIDGE 实例，当前实例正常退出');
   app.quit();
 }
 
@@ -147,16 +205,27 @@ function cancelBridgeStableTimer() {
 function startBridgeWatchdog() {
   if (bridgeWatchdogTimer) return;
   bridgeWatchdogTimer = setInterval(async () => {
-    if (bridgeWatchdogChecking || !shouldRecoverUnownedBridge({
-      desiredRunning: bridgeDesiredRunning,
-      isQuitting,
-      hasChildProcess: bridgeProcess !== null,
-      startInFlight: bridgeStartInFlight,
-    })) return;
+    if (bridgeWatchdogChecking || !bridgeDesiredRunning || isQuitting || bridgeStartInFlight) return;
     bridgeWatchdogChecking = true;
     try {
-      if (!await bridgeIsHealthy()) {
-        console.warn('[Main] Bridge watchdog detected an unavailable reused process; recovering.');
+      if (await bridgeIsHealthy()) {
+        bridgeHealthFailureCount = 0;
+        return;
+      }
+      bridgeHealthFailureCount++;
+      writeDesktopLog('WARN', `Bridge 健康检查失败 (${bridgeHealthFailureCount}/3)`);
+      if (bridgeProcess) {
+        if (bridgeHealthFailureCount >= 3 && bridgeProcess.exitCode === null) {
+          writeDesktopLog('ERROR', 'Bridge 连续健康检查失败，终止失效子进程并自动重启');
+          bridgeProcess.kill('SIGTERM');
+        }
+      } else if (shouldRecoverUnownedBridge({
+        desiredRunning: bridgeDesiredRunning,
+        isQuitting,
+        hasChildProcess: false,
+        startInFlight: bridgeStartInFlight,
+      })) {
+        writeDesktopLog('WARN', 'Bridge watchdog detected an unavailable process; recovering.');
         void startBridgeProcess();
       }
     } finally {
@@ -179,18 +248,16 @@ function scheduleBridgeRestart() {
     restartCount: bridgeRestartCount,
     maxRestarts: MAX_RESTART,
   })) {
-    if (bridgeRestartCount >= MAX_RESTART) {
-      console.error(`[Main] Bridge failed after ${MAX_RESTART} retries, giving up.`);
-    }
     return;
   }
-  bridgeRestartCount++;
+  const delayMs = bridgeRestartDelayMs(bridgeRestartCount, MAX_RESTART);
+  bridgeRestartCount = Math.min(bridgeRestartCount + 1, MAX_RESTART);
   cancelBridgeRestart();
-  console.log(`[Main] Auto-restarting bridge in 3s (attempt ${bridgeRestartCount}/${MAX_RESTART})...`);
+  writeDesktopLog('WARN', `Bridge 将在 ${delayMs}ms 后自动重启，backoff_step=${bridgeRestartCount}`);
   bridgeRestartTimer = setTimeout(() => {
     bridgeRestartTimer = null;
     void startBridgeProcess();
-  }, 3000);
+  }, delayMs);
 }
 
 async function startBridgeProcess() {
@@ -201,14 +268,16 @@ async function startBridgeProcess() {
   if (await bridgeIsHealthy()) {
     bridgeOwnedByApp = false;
     bridgeRestartCount = 0;
+    bridgeHealthFailureCount = 0;
     console.log(`[Main] Reusing bridge already listening on ${BRIDGE_PORT}`);
-    mainWindow?.webContents.send('bridge-status', { running: true });
+    writeDesktopLog('INFO', `复用已在 ${BRIDGE_PORT} 端口运行的 Bridge`);
+    safeSend('bridge-status', { running: true });
     return;
   }
   if (await bridgePortIsOpen()) {
     const message = `端口 ${BRIDGE_PORT} 已被其他异常进程占用，未启动新的 Bridge。`;
     console.error(`[Main] ${message}`);
-    mainWindow?.webContents.send('bridge-status', { running: false, error: message });
+    safeSend('bridge-status', { running: false, error: message });
     scheduleBridgeRestart();
     return;
   }
@@ -219,16 +288,19 @@ async function startBridgeProcess() {
   } catch (err: any) {
     const message = err.message || String(err);
     console.error(`[Main] ${message}`);
-    mainWindow?.webContents.send('bridge-status', { running: false, error: message });
+    safeSend('bridge-status', { running: false, error: message });
     scheduleBridgeRestart();
     return;
   }
   const { cmd, args } = command;
   console.log(`[Main] Starting bridge: ${cmd} ${args.join(' ')}`);
+  writeDesktopLog('INFO', `启动 Bridge 后端: ${cmd}`);
 
   const child = spawn(cmd, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
+    detached: process.platform === 'win32',
+    windowsHide: true,
   });
   bridgeProcess = child;
   bridgeOwnedByApp = true;
@@ -236,22 +308,26 @@ async function startBridgeProcess() {
   child.stdout?.on('data', (data: Buffer) => {
     const text = data.toString();
     console.log(`[Bridge] ${text.trim()}`);
-    mainWindow?.webContents.send('bridge-log', { level: 'info', text: text.trim() });
+    safeSend('bridge-log', { level: 'info', text: text.trim() });
   });
 
   child.stderr?.on('data', (data: Buffer) => {
     const text = data.toString();
     console.error(`[Bridge Error] ${text.trim()}`);
-    mainWindow?.webContents.send('bridge-log', { level: 'error', text: text.trim() });
+    safeSend('bridge-log', { level: 'error', text: text.trim() });
   });
 
-  child.on('close', (code: number | null) => {
+  child.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
     console.log(`[Main] Bridge process exited with code ${code}`);
+    writeDesktopLog(
+      bridgeDesiredRunning && !isQuitting ? 'ERROR' : 'INFO',
+      `Bridge 子进程退出，code=${code}, signal=${signal || 'none'}, intentional=${!bridgeDesiredRunning || isQuitting}`,
+    );
     if (bridgeProcess !== child) return;
     cancelBridgeStableTimer();
     bridgeProcess = null;
     bridgeOwnedByApp = false;
-    mainWindow?.webContents.send('bridge-status', { running: false });
+    safeSend('bridge-status', { running: false });
     // Any unrequested exit is a failure, including exit code 0. Manual stops
     // set bridgeDesiredRunning=false before the child exits.
     scheduleBridgeRestart();
@@ -259,16 +335,19 @@ async function startBridgeProcess() {
 
   child.on('error', (err: Error) => {
     console.error('[Main] Failed to start bridge:', err.message);
+    writeDesktopLog('ERROR', 'Bridge 子进程启动或运行错误', err);
     if (bridgeProcess !== child) return;
     cancelBridgeStableTimer();
     bridgeProcess = null;
     bridgeOwnedByApp = false;
-    mainWindow?.webContents.send('bridge-status', { running: false, error: err.message });
+    safeSend('bridge-status', { running: false, error: err.message });
     scheduleBridgeRestart();
   });
 
   if (await waitForBridgeHealthy(child)) {
-    mainWindow?.webContents.send('bridge-status', { running: true });
+    bridgeHealthFailureCount = 0;
+    safeSend('bridge-status', { running: true });
+    writeDesktopLog('INFO', `Bridge 后端健康检查通过，pid=${child.pid || 'unknown'}`);
     cancelBridgeStableTimer();
     bridgeStableTimer = setTimeout(() => {
       bridgeStableTimer = null;
@@ -280,7 +359,8 @@ async function startBridgeProcess() {
   } else if (bridgeProcess === child && child.exitCode === null) {
     const message = `Bridge 在 ${STARTUP_HEALTH_TIMEOUT_MS / 1000} 秒内未通过健康检查，正在重启。`;
     console.error(`[Main] ${message}`);
-    mainWindow?.webContents.send('bridge-status', { running: false, error: message });
+    writeDesktopLog('ERROR', message);
+    safeSend('bridge-status', { running: false, error: message });
     child.kill('SIGTERM');
   }
   } finally {
@@ -365,20 +445,6 @@ function createWindow() {
   });
 }
 
-// 单实例锁 —— 防止多个进程同时运行导致多个托盘图标
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    // 用户尝试打开第二个实例 → 显示已有窗口
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
-}
 function createTray() {
   // 创建 16x16 托盘图标
   const icon = nativeImage.createFromPath(path.join(isDev ? path.join(__dirname, '..', '..', 'desktop', 'assets') : path.join(process.resourcesPath, 'assets'), 'icon.ico'));
@@ -538,6 +604,12 @@ function restoreCodexOfficialLocally(): { status: string; message: string; backu
       backupCreated = true;
     }
     fs.renameSync(tempPath, configPath);
+    const generatedCatalog = path.join(codexDir, 'lan-bridge', 'merged-models.json');
+    try {
+      if (fs.existsSync(generatedCatalog)) fs.unlinkSync(generatedCatalog);
+    } catch (catalogError) {
+      writeDesktopLog('WARN', '恢复官方直连时无法删除生成的 Bridge 模型目录', catalogError);
+    }
     try {
       const backups = fs.readdirSync(backupDir)
         .filter((name) => /^config\.toml\..+\.bak$/i.test(name))
@@ -613,6 +685,7 @@ function getLaunchAtLoginSetting(): boolean {
 }
 
 app.whenReady().then(() => {
+  writeDesktopLog('INFO', `LAN BRIDGE Desktop 启动，version=${app.getVersion()}, pid=${process.pid}`);
   Menu.setApplicationMenu(null);
   setLaunchAtLogin(getLaunchAtLoginSetting());
   createTray();
@@ -625,6 +698,22 @@ app.whenReady().then(() => {
     bridgeDesiredRunning = false;
     console.log('[Main] auto_start disabled, bridge not started automatically');
   }
+}).catch((error) => {
+  writeDesktopLog('FATAL', 'Electron 初始化失败；主进程保持存活以便诊断', error);
+});
+
+app.on('render-process-gone', (_event, webContents, details) => {
+  writeDesktopLog(
+    details.reason === 'clean-exit' ? 'INFO' : 'ERROR',
+    `渲染进程退出，reason=${details.reason}, exit_code=${details.exitCode}, web_contents_id=${webContents.id}`,
+  );
+});
+
+app.on('child-process-gone', (_event, details) => {
+  writeDesktopLog(
+    details.reason === 'clean-exit' ? 'INFO' : 'ERROR',
+    `Electron 子进程退出，type=${details.type}, reason=${details.reason}, exit_code=${details.exitCode}`,
+  );
 });
 
 app.on('window-all-closed', () => {
@@ -640,6 +729,7 @@ app.on('activate', () => {
 });
 
 app.on('before-quit', () => {
+  writeDesktopLog('INFO', '收到桌面应用退出请求，正在停止 Bridge');
   isQuitting = true;
   bridgeDesiredRunning = false;
   stopBridgeWatchdog();
