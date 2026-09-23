@@ -1,22 +1,19 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useApp } from '../App';
 import { api } from '../services/api';
-import type { AccessKeyAvailableModel, AccessKeyRecord } from '../types';
+import type { AccessKeyRecord } from '../types';
 
 const formatNumber = (value: number) => new Intl.NumberFormat().format(value || 0);
 
 const AccessKeys: React.FC = () => {
   const { tl, lang } = useApp();
   const [keys, setKeys] = useState<AccessKeyRecord[]>([]);
-  const [models, setModels] = useState<AccessKeyAvailableModel[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [newName, setNewName] = useState('');
-  const [newModels, setNewModels] = useState<string[]>(['*']);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
-  const [editModels, setEditModels] = useState<string[]>([]);
   const [revealedKey, setRevealedKey] = useState<{ key: string; name: string } | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -26,8 +23,6 @@ const AccessKeys: React.FC = () => {
     try {
       const result = await api.getAccessKeys();
       setKeys(result.keys);
-      setModels(result.available_models);
-      setNewModels(current => current.length ? current : ['*']);
     } catch (err: any) {
       setError(err.message || String(err));
     } finally {
@@ -37,22 +32,12 @@ const AccessKeys: React.FC = () => {
 
   useEffect(() => { load(); }, [load]);
 
-  const modelByAlias = useMemo(
-    () => new Map(models.map(model => [model.alias, model])),
-    [models],
-  );
-
-  const toggleModel = (alias: string, selected: string[], setter: (next: string[]) => void) => {
-    const explicit = selected.includes('*') ? models.map(model => model.alias) : selected;
-    setter(explicit.includes(alias) ? explicit.filter(item => item !== alias) : [...explicit, alias]);
-  };
-
   const createKey = async () => {
-    if (!newName.trim() || !newModels.length) return;
+    if (!newName.trim()) return;
     setBusy(true);
     setError('');
     try {
-      const result = await api.createAccessKey({ name: newName.trim(), allowed_models: newModels });
+      const result = await api.createAccessKey({ name: newName.trim(), allowed_models: ['*'] });
       setRevealedKey({ key: result.key, name: result.record.name });
       setCopied(false);
       setNewName('');
@@ -67,17 +52,16 @@ const AccessKeys: React.FC = () => {
   const beginEdit = (record: AccessKeyRecord) => {
     setEditingId(record.id);
     setEditName(record.name);
-    setEditModels([...record.allowed_models]);
   };
 
   const saveEdit = async (record: AccessKeyRecord) => {
-    if (!editName.trim() || !editModels.length) return;
+    if (!editName.trim()) return;
     setBusy(true);
     setError('');
     try {
       await api.updateAccessKey(record.id, {
         name: editName.trim(),
-        allowed_models: editModels,
+        allowed_models: ['*'],
         enabled: record.enabled,
       });
       setEditingId(null);
@@ -95,7 +79,7 @@ const AccessKeys: React.FC = () => {
     try {
       await api.updateAccessKey(record.id, {
         name: record.name,
-        allowed_models: record.allowed_models,
+        allowed_models: ['*'],
         enabled,
       });
       await load();
@@ -152,44 +136,13 @@ const AccessKeys: React.FC = () => {
     return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US');
   };
 
-  const modelPicker = (selected: string[], setter: (next: string[]) => void) => (
-    <div className="access-model-picker">
-      <label className={selected.includes('*') ? 'selected' : ''}>
-        <input
-          type="checkbox"
-          checked={selected.includes('*')}
-          onChange={() => setter(selected.includes('*') ? models.map(model => model.alias) : ['*'])}
-        />
-        <span>
-          <strong>{tl(['全部模型（含 Codex 内部模型）', 'All models, including internal Codex models'])}</strong>
-          <code>*</code>
-        </span>
-        <small>{tl(['不限制', 'UNRESTRICTED'])}</small>
-      </label>
-      {models.map(model => (
-        <label key={model.alias} className={selected.includes(model.alias) ? 'selected' : ''}>
-          <input
-            type="checkbox"
-            checked={selected.includes(model.alias)}
-            onChange={() => toggleModel(model.alias, selected, setter)}
-          />
-          <span>
-            <strong>{model.display_name || model.alias}</strong>
-            <code>{model.alias}</code>
-          </span>
-          <small>{model.route_kind === 'native_codex' ? 'OPENAI' : 'CUSTOM'}</small>
-        </label>
-      ))}
-    </div>
-  );
-
   return (
     <div className="page access-keys-page">
       <div className="access-keys-hero">
         <div>
           <span className="eyebrow">CLIENT ACCESS CONTROL</span>
           <h2>{tl(['访问密匙', 'Access Keys'])}</h2>
-            <p>{tl(['为每台客户端分配独立密匙。默认允许全部模型，也可按需限制；完整密匙只在创建或轮换时显示一次。', 'Issue a separate key to each client. Keys allow all models by default, or can be restricted as needed. The full key is shown only once after creation or rotation.'])}</p>
+            <p>{tl(['每个密匙均可请求所有模型；完整密匙只在创建或轮换时显示一次。', 'Each key can request any model. The full key is shown only once after creation or rotation.'])}</p>
         </div>
         <div className="access-summary">
           <strong>{keys.length}</strong>
@@ -225,19 +178,10 @@ const AccessKeys: React.FC = () => {
             <label>{tl(['密匙名称', 'Key name'])}</label>
             <input value={newName} onChange={event => setNewName(event.target.value)} placeholder={tl(['例如：工作室电脑', 'e.g. Studio PC'])} />
           </div>
-          <button className="btn btn-primary" disabled={busy || !newName.trim() || !newModels.length} onClick={createKey}>
+          <button className="btn btn-primary" disabled={busy || !newName.trim()} onClick={createKey}>
             {tl(['生成密匙', 'Generate key'])}
           </button>
         </div>
-        <div className="access-picker-heading">
-          <span>{tl(['允许使用的模型', 'Allowed models'])}</span>
-          <div>
-            <button className="btn btn-sm" onClick={() => setNewModels(['*'])}>{tl(['不限制模型', 'Allow all'])}</button>
-            <button className="btn btn-sm" onClick={() => setNewModels(models.map(model => model.alias))}>{tl(['仅选目录全部', 'Select catalog'])}</button>
-            <button className="btn btn-sm" onClick={() => setNewModels([])}>{tl(['清空', 'Clear'])}</button>
-          </div>
-        </div>
-        {models.length ? modelPicker(newModels, setNewModels) : <p className="muted">{tl(['暂无可分配模型', 'No models are available'])}</p>}
       </section>
 
       <section className="access-key-list">
@@ -271,14 +215,6 @@ const AccessKeys: React.FC = () => {
                 </label>
               </div>
 
-              {editing ? modelPicker(editModels, setEditModels) : (
-                <div className="access-model-tags">
-                  {record.allowed_models.includes('*') ? (
-                    <span>{tl(['全部模型（含 Codex 内部模型）', 'All models, including internal Codex models'])}<code>*</code></span>
-                  ) : record.allowed_models.map(alias => <span key={alias}>{modelByAlias.get(alias)?.display_name || alias}<code>{alias}</code></span>)}
-                </div>
-              )}
-
               <div className="access-key-stats">
                 <span><strong>{formatNumber(record.request_count)}</strong>{tl(['请求', 'requests'])}</span>
                 <span><strong>{formatNumber(record.total_tokens)}</strong>Tokens</span>
@@ -289,7 +225,7 @@ const AccessKeys: React.FC = () => {
               <div className="row-actions access-key-actions">
                 {editing ? (
                   <>
-                    <button className="btn btn-sm btn-primary" disabled={busy || !editName.trim() || !editModels.length} onClick={() => saveEdit(record)}>{tl('common.save')}</button>
+                    <button className="btn btn-sm btn-primary" disabled={busy || !editName.trim()} onClick={() => saveEdit(record)}>{tl('common.save')}</button>
                     <button className="btn btn-sm" onClick={() => setEditingId(null)}>{tl('common.cancel')}</button>
                   </>
                 ) : (

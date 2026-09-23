@@ -4,7 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from code_cn_bridge import admin_api, server
 
@@ -385,9 +387,25 @@ class CodexSwitchTests(unittest.TestCase):
         with patch.object(admin_api, "get_config", return_value=config), patch.object(
             admin_api, "get_registry", return_value=registry
         ):
-            response = asyncio.run(admin_api.list_models())
+            response = asyncio.run(admin_api.list_models(Request({"type": "http", "method": "GET", "path": "/admin/api/models", "headers": [], "query_string": b""})))
 
         self.assertTrue(response["models"][0]["is_reasoning_text"])
+
+    def test_model_library_includes_new_native_catalog_entry(self):
+        config = self._config()
+        config.native_models = {"gpt-5.6-sol": {"enabled": True}}
+        config.model_mapping = {}
+        config.providers = {}
+        registry = SimpleNamespace(list=lambda: [])
+        catalog = JSONResponse({"models": [{"slug": "gpt-6-astra-preview", "display_name": "GPT-6 Astra Preview"}]})
+        request = Request({"type": "http", "method": "GET", "path": "/admin/api/models", "headers": [], "query_string": b""})
+        with patch.object(admin_api, "get_config", return_value=config), patch.object(
+            admin_api, "get_registry", return_value=registry
+        ), patch.object(admin_api, "fetch_merged_models", new=AsyncMock(return_value=catalog)):
+            response = asyncio.run(admin_api.list_models(request))
+        native = next(model for model in response["models"] if model["alias"] == "gpt-6-astra-preview")
+        self.assertTrue(native["read_only"])
+        self.assertEqual(native["display_name"], "GPT-6 Astra Preview")
 
     def test_model_list_exposes_effective_context_defaults_without_persisting_them(self):
         config = self._config()
@@ -405,7 +423,7 @@ class CodexSwitchTests(unittest.TestCase):
         with patch.object(admin_api, "get_config", return_value=config), patch.object(
             admin_api, "get_registry", return_value=registry
         ):
-            response = asyncio.run(admin_api.list_models())
+            response = asyncio.run(admin_api.list_models(Request({"type": "http", "method": "GET", "path": "/admin/api/models", "headers": [], "query_string": b""})))
 
         model = response["models"][0]
         self.assertEqual(model["capabilities"], {})

@@ -126,6 +126,19 @@ def resolve_route(config, model: str) -> Route:
         )
 
     provider, target = config.resolve_model(requested)
+    if provider == "unknown" and requested and requested != "unknown":
+        # A bridge key may request a newly released native model by its ID.
+        # Explicitly disabled aliases retain their configured denial behavior.
+        native_entry = getattr(config, "native_models", {}).get(requested)
+        if not isinstance(entry, dict) and not isinstance(native_entry, dict):
+            return Route(
+                kind="native_codex",
+                requested_model=requested,
+                target_model=requested,
+                provider="native_codex",
+                adapter="native_codex",
+                auth_mode="host_login",
+            )
     provider_info = getattr(config, "providers", {}).get(provider, {})
     return Route(
         kind="custom",

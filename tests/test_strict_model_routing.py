@@ -68,6 +68,16 @@ class StrictModelRoutingTests(unittest.TestCase):
         self.assertEqual(route.provider, "deepseek")
         self.assertEqual(route.target_model, "deepseek-reasoner")
 
+    def test_existing_native_model_inherits_default_media_capabilities(self):
+        native = self.config.native_models["gpt-5.6-sol"]
+
+        self.assertTrue(native["capabilities"]["vision"])
+        self.assertTrue(native["capabilities"]["image_generation"])
+        self.assertFalse(self.config.native_models["gpt-disabled"]["enabled"])
+        self.assertIn("gpt-6-astra", self.config.native_models)
+        self.assertIn("gpt-6-sol", self.config.native_models)
+        self.assertIn("gpt-6-luna", self.config.native_models)
+
     def test_responses_slot_route_preserves_model_wire_metadata(self):
         self.config.data["model_mapping"]["deepseek-v4-pro-responses"] = {
             "provider": "deepseek",
@@ -95,9 +105,14 @@ class StrictModelRoutingTests(unittest.TestCase):
 
         route = resolve_route(self.config, "gpt-never-configured")
 
-        self.assertEqual(route.kind, "custom")
-        self.assertEqual(route.provider, "unknown")
+        self.assertEqual(route.kind, "native_codex")
+        self.assertEqual(route.target_model, "gpt-never-configured")
         self.assertNotEqual(route.provider, "ai.licco.top")
+
+    def test_new_native_model_needs_no_registry_entry(self):
+        route = resolve_route(self.config, "gpt-6-astra-preview")
+        self.assertEqual(route.kind, "native_codex")
+        self.assertEqual(route.target_model, "gpt-6-astra-preview")
 
     def test_only_enabled_native_models_are_routed_natively(self):
         self.assertEqual(resolve_route(self.config, "gpt-5.6-sol").kind, "native_codex")

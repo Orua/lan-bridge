@@ -510,15 +510,19 @@ model_mapping:
         self.assertEqual(entry["upstream_protocol"], "responses")
         self.assertTrue(is_chat_to_responses_mapping(entry))
 
-    def test_unknown_chat_model_returns_4xx(self):
+    def test_unconfigured_chat_model_is_forwarded_to_native_upstream(self):
         config = _Config()
-        with patch.object(server, "get_config", return_value=config):
+        upstream = JSONResponse({"error": {"type": "model_not_found"}}, status_code=404)
+        with patch.object(server, "get_config", return_value=config), patch.object(
+            server, "proxy_chat_to_native_responses", new=AsyncMock(return_value=upstream)
+        ) as proxy:
             result = TestClient(server.create_app()).post(
                 "/v1/chat/completions",
                 json={"model": "not-configured", "messages": [{"role": "user", "content": "hi"}]},
             )
-        self.assertEqual(result.status_code, 400)
+        self.assertEqual(result.status_code, 404)
         self.assertEqual(result.json()["error"]["type"], "model_not_found")
+        self.assertEqual(proxy.await_args.args[2], "not-configured")
 
 
 if __name__ == "__main__":

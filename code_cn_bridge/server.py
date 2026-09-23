@@ -148,28 +148,25 @@ def _bind_stream_principal(response, principal: BridgePrincipal):
     return response
 
 
-def _configured_model_dependency_aliases(cfg, model: str, body: dict, endpoint: str) -> list[str]:
+def _configured_model_dependency_aliases(
+    cfg,
+    model: str,
+    body: dict,
+    endpoint: str,
+    *,
+    route=None,
+) -> list[str]:
     """Return user-facing aliases that an allowed model may delegate to."""
+    resolved_route = route if route is not None else resolve_route(cfg, model)
     dependencies: list[str] = []
     entry = cfg.model_mapping.get(model)
     entry = entry if isinstance(entry, dict) else {}
+    supports_vision = _route_supports_media_capability(resolved_route, "vision")
+    supports_image_generation = _route_supports_media_capability(
+        resolved_route, "image_generation"
+    )
 
     input_items = body.get("input", [])
-    has_images = (
-        _chat_has_images(body)
-        if endpoint == "chat"
-        else _current_turn_has_images(input_items if isinstance(input_items, list) else [])
-    )
-    if has_images and not entry.get("is_multimodal"):
-        vision_alias = str(entry.get("vision_alias") or "").strip()
-        if not vision_alias:
-            try:
-                vision_alias = str(cfg.slot_alias("vision") or "").strip()
-            except (KeyError, TypeError, AttributeError):
-                vision_alias = ""
-        if vision_alias and vision_alias != model and vision_alias in cfg.model_mapping:
-            dependencies.append(vision_alias)
-
     tools = body.get("tools") or []
     image_tool_requested = any(
         isinstance(tool, dict) and tool.get("type") in ("image_gen", "image_generation")
@@ -179,7 +176,7 @@ def _configured_model_dependency_aliases(cfg, model: str, body: dict, endpoint: 
         image_tool_requested = _looks_like_image_generation_request(
             _latest_user_text(input_items if isinstance(input_items, list) else [])
         )
-    if image_tool_requested and not entry.get("is_image_gen"):
+    if image_tool_requested and not supports_image_generation:
         image_alias = str(entry.get("image_gen_alias") or "").strip()
         if not image_alias:
             try:
@@ -188,7 +185,172 @@ def _configured_model_dependency_aliases(cfg, model: str, body: dict, endpoint: 
                 image_alias = ""
         if image_alias and image_alias != model and image_alias in cfg.model_mapping:
             dependencies.append(image_alias)
+
+    has_images = (
+        _chat_has_images(body)
+        if endpoint == "chat"
+        else _current_turn_has_images(input_items if isinstance(input_items, list) else [])
+    )
+    if has_images and not image_tool_requested and not supports_vision:
+        vision_alias = str(entry.get("vision_alias") or "").strip()
+        if not vision_alias:
+            try:
+                vision_alias = str(cfg.slot_alias("vision") or "").strip()
+            except (KeyError, TypeError, AttributeError):
+                vision_alias = ""
+        if vision_alias and vision_alias != model and vision_alias in cfg.model_mapping:
+            dependencies.append(vision_alias)
     return list(dict.fromkeys(dependencies))
+
+
+def _route_supports_media_capability(route, capability: str) -> bool:
+    """Use ChatGPT native media support as the default when flags are omitted."""
+    metadata = route.metadata if isinstance(route.metadata, dict) else {}
+    capabilities = metadata.get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    direct_chatgpt = str(getattr(route, "kind", "")) == "native_codex"
+    if direct_chatgpt:
+        return capability in {"vision", "image_generation"}
+    if capability == "vision":
+        if "vision" in capabilities:
+            return bool(capabilities["vision"])
+        if "image_input" in capabilities:
+            return bool(capabilities["image_input"])
+        if "is_multimodal" in metadata:
+            return bool(metadata["is_multimodal"])
+        return False
+    if capability == "image_generation":
+        if "image_generation" in capabilities:
+            return bool(capabilities["image_generation"])
+        if "is_image_gen" in metadata:
+            return bool(metadata["is_image_gen"])
+        return False
+    return False
+
+
+def _ensure_native_image_generation_tool(body: dict, route) -> bool:
+    """Expose the hosted tool for an explicit image request on capable ChatGPT models."""
+    if not _route_supports_media_capability(route, "image_generation"):
+        return False
+    input_items = body.get("input")
+    if not isinstance(input_items, list):
+        return False
+    latest_text = _latest_user_text(input_items)
+    if not (_looks_like_image_generation_request(latest_text) or _looks_like_image_edit_request(latest_text)):
+        return False
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        tools = []
+        body["tools"] = tools
+    if any(
+        isinstance(tool, dict)
+        and str(tool.get("type") or "").lower() in {"image_gen", "image_generation"}
+        for tool in tools
+    ):
+        return False
+    tools.append({"type": "image_generation"})
+    return True
+
+
+def _is_client_image_generation_tool(tool: object) -> bool:
+    """Identify client-executed image tools without matching the hosted tool."""
+    if not isinstance(tool, dict):
+        return False
+    tool_type = str(tool.get("type") or "").strip().lower()
+    if tool_type in {"image_gen", "image_generation"}:
+        return False
+    function = tool.get("function")
+    identifiers = [
+        tool.get("name"),
+        tool.get("tool_name"),
+        tool.get("server_label"),
+        tool.get("server"),
+        tool.get("server_name"),
+        tool.get("namespace"),
+        tool.get("namespace_name"),
+        function.get("name") if isinstance(function, dict) else None,
+    ]
+    normalized = {
+        re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+        for value in identifiers
+        if value
+    }
+    exact_names = {
+        "image_gen",
+        "image_generation",
+        "imagegen",
+        "image_gen_imagegen",
+        "goldenluck_imagegen",
+        "generate_image",
+        "edit_image",
+    }
+    serialized = re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        json.dumps(tool, ensure_ascii=False, sort_keys=True, default=str).lower(),
+    ).strip("_")
+    return "goldenluck_imagegen" in serialized or bool(normalized & exact_names) or any(
+        name.endswith("_image_gen_imagegen")
+        or name.endswith("_goldenluck_imagegen")
+        or (
+            name.endswith(("_generate_image", "_edit_image"))
+            and ("imagegen" in name or "image_gen" in name)
+        )
+        for name in normalized
+    )
+
+
+def _replace_client_image_tools_with_hosted(body: dict, route) -> int:
+    """Use OpenAI-hosted image generation when the selected model supports it."""
+    if not _route_supports_media_capability(route, "image_generation"):
+        return 0
+
+    removed = 0
+
+    def prune(value: object) -> object:
+        nonlocal removed
+        if isinstance(value, list):
+            kept = []
+            for item in value:
+                if _is_client_image_generation_tool(item):
+                    removed += 1
+                    continue
+                kept.append(prune(item))
+            return kept
+        if isinstance(value, dict):
+            return {key: prune(item) for key, item in value.items()}
+        return value
+
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        body["tools"] = prune(tools)
+
+    input_items = body.get("input")
+    if isinstance(input_items, list):
+        normalized_input = []
+        for item in input_items:
+            if not isinstance(item, dict) or item.get("type") != "additional_tools":
+                normalized_input.append(item)
+                continue
+            normalized = prune(item)
+            if isinstance(normalized, dict):
+                nested_tools = normalized.get("tools")
+                if not isinstance(nested_tools, list) or nested_tools:
+                    normalized_input.append(normalized)
+        body["input"] = normalized_input
+
+    if removed:
+        hosted_tools = body.get("tools")
+        if not isinstance(hosted_tools, list):
+            hosted_tools = []
+            body["tools"] = hosted_tools
+        if not any(
+            isinstance(tool, dict)
+            and str(tool.get("type") or "").lower() in {"image_gen", "image_generation"}
+            for tool in hosted_tools
+        ):
+            hosted_tools.append({"type": "image_generation"})
+    return removed
 
 _SENSITIVE_KEYS = {"api_key", "authorization", "token", "access_token", "refresh_token", "key"}
 _BRIDGE_SECRET_RE = re.compile(r"\blbk_[A-Za-z0-9_-]{40,}\b")
@@ -3275,14 +3437,29 @@ def _responses_tool_summary(tools: list[dict] | None) -> str:
     return _bounded_tool_summary(result)
 
 
-def _requires_media_routing(body: dict) -> bool:
-    """Keep image/video requests on the bridge's capability-routing pipeline."""
-    input_items = body.get("input", []) or []
-    if isinstance(input_items, list) and _current_turn_has_images(input_items):
+def _requires_media_routing(body: dict, route=None) -> bool:
+    """Route media to slots only when the selected model lacks that capability."""
+    image_tool_types = {"image_gen", "image_generation"}
+    has_image_tool = any(
+        isinstance(tool, dict) and str(tool.get("type") or "").lower() in image_tool_types
+        for tool in body.get("tools", []) or []
+    )
+    if has_image_tool and (
+        route is None or not _route_supports_media_capability(route, "image_generation")
+    ):
         return True
-    media_tool_types = {"image_gen", "image_generation", "video_gen", "video_generation"}
+    if has_image_tool:
+        return False
+    input_items = body.get("input", []) or []
+    if (
+        isinstance(input_items, list)
+        and _current_turn_has_images(input_items)
+        and (route is None or not _route_supports_media_capability(route, "vision"))
+    ):
+        return True
+    video_tool_types = {"video_gen", "video_generation"}
     return any(
-        isinstance(tool, dict) and str(tool.get("type") or "").lower() in media_tool_types
+        isinstance(tool, dict) and str(tool.get("type") or "").lower() in video_tool_types
         for tool in body.get("tools", []) or []
     )
 
@@ -3722,6 +3899,12 @@ def create_app(verbose: bool = False) -> FastAPI:
                 if isinstance(model, dict)
                 and principal.can_use_model(str(model.get("slug") or model.get("id") or ""))
             ]
+            if isinstance(payload.get("data"), list):
+                payload["data"] = [
+                    model for model in payload["data"]
+                    if isinstance(model, dict)
+                    and principal.can_use_model(str(model.get("id") or ""))
+                ]
         return JSONResponse(content=payload, status_code=200)
 
     @app.post("/admin/reload-config")
@@ -3875,7 +4058,10 @@ def create_app(verbose: bool = False) -> FastAPI:
         if denied is not None:
             _record_request(start_time, model, "responses", 403, bool(stream), "model permission denied")
             return denied
-        for dependency in _configured_model_dependency_aliases(cfg, model, body, "responses"):
+        route = resolve_route(cfg, model)
+        for dependency in _configured_model_dependency_aliases(
+            cfg, model, body, "responses", route=route
+        ):
             denied = _model_access_response(principal, dependency)
             if denied is not None:
                 _record_request(
@@ -3888,16 +4074,30 @@ def create_app(verbose: bool = False) -> FastAPI:
         request_client_ip = (
             request.client.host if request.client and request.client.host else current_client_ip()
         )
-        route = resolve_route(cfg, model)
         provider_name = route.provider
         target_model = route.target_model
-        if route.kind == "native_codex":
+        if route.kind == "native_codex" and not _requires_media_routing(body, route):
             if isinstance(body.get("input"), str):
                 body["input"] = [{
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": body["input"]}],
                 }]
+            replaced_image_tools = _replace_client_image_tools_with_hosted(body, route)
+            injected_image_tool = _ensure_native_image_generation_tool(body, route)
+            if replaced_image_tools:
+                _audit_event(
+                    "responses.native_image_tool_replaced",
+                    request_id,
+                    model=model,
+                    replaced_tools=replaced_image_tools,
+                )
+            if injected_image_tool:
+                _audit_event(
+                    "responses.native_image_tool_injected",
+                    request_id,
+                    model=model,
+                )
             try:
                 native_tokens = 0
                 native_finished = False
@@ -4022,7 +4222,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                 )
 
         provider = cfg.get_provider(route.provider) or {}
-        if model_uses_responses(route.provider, provider, route.metadata) and not _requires_media_routing(body):
+        if model_uses_responses(route.provider, provider, route.metadata) and not _requires_media_routing(body, route):
             try:
                 provider_tokens = 0
                 provider_finished = False
@@ -4681,8 +4881,10 @@ def create_app(verbose: bool = False) -> FastAPI:
         if denied is not None:
             _record_request(start_time, model, "chat", 403, bool(stream), "model permission denied")
             return denied
+        cfg = get_config()
+        route = resolve_route(cfg, model)
         for dependency in _configured_model_dependency_aliases(
-            get_config(), model, body, "chat"
+            cfg, model, body, "chat", route=route
         ):
             denied = _model_access_response(principal, dependency)
             if denied is not None:
@@ -4700,8 +4902,6 @@ def create_app(verbose: bool = False) -> FastAPI:
             text_distribution=_chat_text_distribution(body),
         )
 
-        cfg = get_config()
-        route = resolve_route(cfg, model)
         model_entry = cfg.model_mapping.get(model)
         if isinstance(model_entry, dict) and not model_entry.get("enabled", True):
             message = f"模型别名已禁用: {model}"

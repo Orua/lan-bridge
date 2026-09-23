@@ -281,12 +281,14 @@ env_key = "LAN_BRIDGE_API_KEY"
 requires_openai_auth = false
 ```
 
-Set `LAN_BRIDGE_API_KEY` on the client to the key issued by LAN BRIDGE. Select
-the desired route by model name. For example, the configured native aliases
-`gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` use the bridge host's native
-Codex route; configured DeepSeek, Qwen, and Grok aliases continue to use their
-existing provider adapters. The bridge does not forward a client OpenAI login
-state.
+Set `LAN_BRIDGE_API_KEY` on the client to the key issued by LAN BRIDGE. Any
+valid key can send a new native Codex model ID, such as `gpt-6-astra`, directly
+as `model` without adding a model mapping. Existing keys also allow all model
+IDs, even if they were issued when the manager exposed model selection.
+Explicit custom provider aliases still use their configured adapters.
+`/v1/models` returns both the native Codex `models` catalog and OpenAI-compatible
+`object: list` / `data` entries. The bridge does not forward a client OpenAI
+login state.
 
 ### Host Codex login injection (same-user trusted LAN)
 

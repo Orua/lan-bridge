@@ -42,20 +42,38 @@ DEFAULT_WEB_SEARCH = {
 }
 
 DEFAULT_NATIVE_MODELS = {
+    "gpt-6-astra": {
+        "display_name": "GPT-6 Astra", "enabled": True,
+        "description": "OpenAI Codex native model",
+        "capabilities": {"vision": True, "image_generation": True},
+    },
+    "gpt-6-sol": {
+        "display_name": "GPT-6 Sol", "enabled": True,
+        "description": "OpenAI Codex native model",
+        "capabilities": {"vision": True, "image_generation": True},
+    },
+    "gpt-6-luna": {
+        "display_name": "GPT-6 Luna", "enabled": True,
+        "description": "OpenAI Codex native model",
+        "capabilities": {"vision": True, "image_generation": True},
+    },
     "gpt-5.6-sol": {
         "display_name": "GPT-5.6 Sol",
         "description": "OpenAI Codex native model",
         "enabled": True,
+        "capabilities": {"vision": True, "image_generation": True},
     },
     "gpt-5.6-terra": {
         "display_name": "GPT-5.6 Terra",
         "description": "OpenAI Codex native model",
         "enabled": True,
+        "capabilities": {"vision": True, "image_generation": True},
     },
     "gpt-5.6-luna": {
         "display_name": "GPT-5.6 Luna",
         "description": "OpenAI Codex native model",
         "enabled": True,
+        "capabilities": {"vision": True, "image_generation": True},
     },
 }
 
@@ -286,7 +304,26 @@ class Config:
         self._inject_provider_env(providers)
         web_search = _deep_merge(copy.deepcopy(DEFAULT_WEB_SEARCH), self._data.get("web_search", {}))
         self._data["web_search"] = web_search
-        self._data.setdefault("native_models", copy.deepcopy(DEFAULT_NATIVE_MODELS))
+        configured_native_models = self._data.get("native_models")
+        if isinstance(configured_native_models, dict):
+            native_models = _deep_merge(copy.deepcopy(DEFAULT_NATIVE_MODELS), configured_native_models)
+        elif isinstance(configured_native_models, list):
+            native_models = configured_native_models
+        else:
+            native_models = copy.deepcopy(DEFAULT_NATIVE_MODELS)
+        self._data["native_models"] = native_models
+        if isinstance(native_models, dict):
+            for alias, entry in list(native_models.items()):
+                defaults = DEFAULT_NATIVE_MODELS.get(str(alias))
+                if isinstance(defaults, dict) and isinstance(entry, dict):
+                    entry = _deep_merge(copy.deepcopy(defaults), entry)
+                if isinstance(entry, dict):
+                    capabilities = entry.get("capabilities")
+                    capabilities = dict(capabilities) if isinstance(capabilities, dict) else {}
+                    capabilities["vision"] = True
+                    capabilities["image_generation"] = True
+                    entry["capabilities"] = capabilities
+                    native_models[alias] = entry
         self._data["access_control"] = _deep_merge(
             copy.deepcopy(DEFAULT_ACCESS_CONTROL),
             self._data.get("access_control", {}),

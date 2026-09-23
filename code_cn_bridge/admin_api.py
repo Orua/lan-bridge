@@ -33,7 +33,7 @@ from .adapters import get_registry
 from .stats import get_stats, RequestLog
 from .client import UpstreamClient
 from .http_utils import make_async_client, make_provider_async_client
-from .native_proxy import custom_model_context_settings, merge_model_catalog
+from .native_proxy import custom_model_context_settings, fetch_merged_models, merge_model_catalog
 from .codex_auth import resolve_auth_file
 from .access_control import (
     BridgeAccessError,
@@ -243,15 +243,38 @@ async def get_status():
 # ═══════════════════════════════════════════════════════════════════
 
 @router.get("/models")
-async def list_models():
+async def list_models(request: Request):
     """Return the native catalog entries and the editable custom model library."""
     cfg = get_config()
     reg = get_registry()
     providers = cfg.providers
     mapping = cfg.model_mapping
 
+    native_entries = dict(cfg.native_models)
+    if native_entries:
+        try:
+            response = await fetch_merged_models(request, cfg)
+            if response.status_code == 200:
+                payload = json.loads(response.body)
+                for item in payload.get("models", []):
+                    if not isinstance(item, dict):
+                        continue
+                    alias = str(item.get("slug") or "").strip()
+                    if not alias or alias in mapping:
+                        continue
+                    existing = native_entries.get(alias)
+                    if isinstance(existing, dict) and not existing.get("enabled", True):
+                        continue
+                    native_entries[alias] = {
+                        **(existing if isinstance(existing, dict) else {}),
+                        "display_name": item.get("display_name") or alias,
+                        "description": item.get("description") or "OpenAI Codex native model",
+                    }
+        except (ValueError, httpx.HTTPError) as exc:
+            logger.debug("Native model catalog unavailable for admin list: %s", exc)
+
     models = []
-    for alias, metadata in cfg.native_models.items():
+    for alias, metadata in native_entries.items():
         if not isinstance(metadata, dict):
             metadata = {}
         models.append({
@@ -1208,13 +1231,8 @@ async def list_access_keys():
 @router.post("/access-keys")
 async def create_access_key(data: dict):
     cfg = get_config()
-    allowed = {item["alias"] for item in _available_access_models(cfg)}
-    requested = [str(item) for item in data.get("allowed_models", [])]
-    invalid = sorted(set(requested) - allowed - {"*"})
-    if invalid:
-        raise HTTPException(status_code=400, detail=f"Unknown model permission: {invalid[0]}")
     try:
-        raw_key, record = get_access_key_store(cfg).create(data.get("name", ""), requested)
+        raw_key, record = get_access_key_store(cfg).create(data.get("name", ""), ["*"])
         if not access_control_enabled(cfg):
             with _edit_config(cfg) as config_data:
                 config_data.setdefault("access_control", {})["enabled"] = True
@@ -1227,12 +1245,7 @@ async def create_access_key(data: dict):
 @router.put("/access-keys/{key_id}")
 async def update_access_key(key_id: str, data: dict):
     cfg = get_config()
-    allowed = {item["alias"] for item in _available_access_models(cfg)}
-    if "allowed_models" in data:
-        requested = [str(item) for item in data.get("allowed_models", [])]
-        invalid = sorted(set(requested) - allowed - {"*"})
-        if invalid:
-            raise HTTPException(status_code=400, detail=f"Unknown model permission: {invalid[0]}")
+    data = {**data, "allowed_models": ["*"]}
     try:
         record = get_access_key_store(cfg).update(key_id, data)
     except KeyError as exc:

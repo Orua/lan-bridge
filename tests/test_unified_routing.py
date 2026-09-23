@@ -67,7 +67,11 @@ class FakeConfig:
             },
         }
         self.native_models = {
-            "gpt-5.6-sol": {"display_name": "GPT-5.6 Sol", "enabled": True},
+            "gpt-5.6-sol": {
+                "display_name": "GPT-5.6 Sol",
+                "enabled": True,
+                "capabilities": {"vision": True, "image_generation": True},
+            },
         }
         self.model_slots = {}
         self.vision_routing = {}
@@ -124,6 +128,324 @@ class UnifiedRoutingTests(unittest.TestCase):
 
         self.assertEqual(route.kind, "native_codex")
         self.assertEqual(route.auth_mode, "host_login")
+
+    def test_native_image_generation_request_bypasses_image_slot(self):
+        cfg = FakeConfig()
+        cfg.slot_alias = lambda slot_id: self.fail(
+            f"native ChatGPT request consulted capability slot: {slot_id}"
+        )
+        native_response = JSONResponse({"id": "resp_image", "output": []})
+        with (
+            patch.object(server, "get_config", return_value=cfg),
+            patch.object(
+                server,
+                "proxy_native_responses",
+                new=AsyncMock(return_value=native_response),
+            ) as proxy,
+        ):
+            response = TestClient(server.create_app()).post(
+                "/v1/responses",
+                json={
+                    "model": "gpt-5.6-sol",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "生成一张蓝色小鸟图片"}],
+                    }],
+                    "tools": [{"type": "image_generation"}],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = proxy.await_args.args[1]
+        self.assertEqual(forwarded["tools"], [{"type": "image_generation"}])
+        self.assertEqual(forwarded["model"], "gpt-5.6-sol")
+
+    def test_native_chatgpt_without_capability_flags_defaults_to_hosted_image(self):
+        cfg = FakeConfig()
+        cfg.native_models["gpt-5.6-sol"].pop("capabilities", None)
+        cfg.slot_alias = lambda slot_id: self.fail(
+            f"native ChatGPT request consulted fallback slot: {slot_id}"
+        )
+        native_response = JSONResponse({"id": "resp_image", "output": []})
+        with (
+            patch.object(server, "get_config", return_value=cfg),
+            patch.object(
+                server,
+                "proxy_native_responses",
+                new=AsyncMock(return_value=native_response),
+            ) as proxy,
+        ):
+            response = TestClient(server.create_app()).post(
+                "/v1/responses",
+                json={
+                    "model": "gpt-5.6-sol",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "生成一张蓝色小鸟图片"}],
+                    }],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(proxy.await_args.args[1]["tools"], [{"type": "image_generation"}])
+
+    def test_non_chatgpt_without_image_capability_keeps_fallback_route(self):
+        cfg = FakeConfig()
+        route = resolve_route(cfg, "deepseek-v4-pro")
+        body = {
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "生成一张蓝色小鸟图片"}],
+            }],
+        }
+
+        self.assertFalse(server._ensure_native_image_generation_tool(body, route))
+        self.assertNotIn("tools", body)
+
+    def test_native_image_tool_remains_available_after_an_agent_tool_round(self):
+        cfg = FakeConfig()
+        cfg.native_models["gpt-5.6-sol"].pop("capabilities", None)
+        route = resolve_route(cfg, "gpt-5.6-sol")
+        body = {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "生成一张蓝色小鸟图片"}],
+                },
+                {"type": "custom_tool_call", "name": "read_file", "call_id": "call_1", "input": "{}"},
+                {"type": "custom_tool_call_output", "call_id": "call_1", "output": "instructions"},
+            ],
+        }
+
+        self.assertTrue(server._ensure_native_image_generation_tool(body, route))
+        self.assertEqual(body["tools"], [{"type": "image_generation"}])
+
+    def test_native_image_edit_request_bypasses_vision_and_image_slots(self):
+        cfg = FakeConfig()
+        cfg.slot_alias = lambda slot_id: self.fail(
+            f"native ChatGPT request consulted capability slot: {slot_id}"
+        )
+        native_response = JSONResponse({"id": "resp_edit", "output": []})
+        with (
+            patch.object(server, "get_config", return_value=cfg),
+            patch.object(
+                server,
+                "proxy_native_responses",
+                new=AsyncMock(return_value=native_response),
+            ) as proxy,
+        ):
+            response = TestClient(server.create_app()).post(
+                "/v1/responses",
+                json={
+                    "model": "gpt-5.6-sol",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "把背景改成白色"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,c291cmNl"},
+                        ],
+                    }],
+                    "tools": [{"type": "image_generation"}],
+                    "stream": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = proxy.await_args.args[1]
+        content = forwarded["input"][0]["content"]
+        self.assertEqual(content[1]["type"], "input_image")
+        self.assertEqual(forwarded["tools"], [{"type": "image_generation"}])
+
+    def test_native_capable_route_replaces_client_image_tool_with_hosted_tool(self):
+        cfg = FakeConfig()
+        native_response = JSONResponse({"id": "resp_image", "output": []})
+        with (
+            patch.object(server, "get_config", return_value=cfg),
+            patch.object(
+                server,
+                "proxy_native_responses",
+                new=AsyncMock(return_value=native_response),
+            ) as proxy,
+        ):
+            response = TestClient(server.create_app()).post(
+                "/v1/responses",
+                json={
+                    "model": "gpt-5.6-sol",
+                    "input": [
+                        {
+                            "type": "additional_tools",
+                            "tools": [
+                                {
+                                    "type": "custom",
+                                    "name": "image_gen__imagegen",
+                                    "description": "Generate or edit an image",
+                                },
+                                {"type": "custom", "name": "local_executor"},
+                            ],
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "生成一张蓝色小鸟图片"}],
+                        },
+                    ],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        forwarded = proxy.await_args.args[1]
+        self.assertEqual(forwarded["tools"], [{"type": "image_generation"}])
+        self.assertEqual(
+            forwarded["input"][0]["tools"],
+            [{"type": "custom", "name": "local_executor"}],
+        )
+
+    def test_agent_imagegen_namespace_is_replaced_for_native_model(self):
+        cfg = FakeConfig()
+        route = resolve_route(cfg, "gpt-5.6-sol")
+        body = {
+            "input": [{
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "namespace": "mcp__goldenluck_imagegen",
+                        "tools": [
+                            {"type": "custom", "name": "mcp__goldenluck_imagegen__generate_image"},
+                            {"type": "custom", "name": "mcp__goldenluck_imagegen__edit_image"},
+                        ],
+                    },
+                    {"type": "custom", "name": "local_executor"},
+                ],
+            }],
+        }
+
+        replaced = server._replace_client_image_tools_with_hosted(body, route)
+
+        self.assertEqual(replaced, 1)
+        self.assertEqual(body["tools"], [{"type": "image_generation"}])
+        self.assertEqual(
+            body["input"][0]["tools"],
+            [{"type": "custom", "name": "local_executor"}],
+        )
+
+    def test_client_image_tool_is_preserved_for_model_without_hosted_capability(self):
+        cfg = FakeConfig()
+        route = resolve_route(cfg, "deepseek-v4-pro")
+        body = {
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "function",
+                    "function": {"name": "image_gen__imagegen"},
+                }],
+            }],
+        }
+
+        replaced = server._replace_client_image_tools_with_hosted(body, route)
+
+        self.assertEqual(replaced, 0)
+        self.assertNotIn("tools", body)
+        self.assertEqual(
+            body["input"][0]["tools"][0]["function"]["name"],
+            "image_gen__imagegen",
+        )
+
+    def test_media_routing_uses_slots_only_for_missing_model_capabilities(self):
+        cfg = FakeConfig()
+        cfg.model_mapping.update({
+            "custom-capable": {
+                "target": "custom-capable-target",
+                "provider": "deepseek",
+                "capabilities": {"vision": True, "image_generation": True},
+            },
+            "vision-fallback": {
+                "target": "vision-target",
+                "provider": "vision-provider",
+                "is_multimodal": True,
+            },
+            "image-fallback": {
+                "target": "image-target",
+                "provider": "image-provider",
+                "is_image_gen": True,
+            },
+        })
+        cfg.slot_alias = lambda slot_id: {
+            "vision": "vision-fallback",
+            "image_gen": "image-fallback",
+        }[slot_id]
+        capable_route = resolve_route(cfg, "custom-capable")
+        image_body = {
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "edit this"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,c291cmNl"},
+                ],
+            }],
+            "tools": [{"type": "image_generation"}],
+        }
+
+        self.assertEqual(
+            server._configured_model_dependency_aliases(
+                cfg, "custom-capable", image_body, "responses", route=capable_route
+            ),
+            [],
+        )
+        self.assertFalse(server._requires_media_routing(image_body, capable_route))
+
+        cfg.model_mapping["custom-capable"]["capabilities"] = {
+            "vision": False,
+            "image_generation": False,
+        }
+        incapable_route = resolve_route(cfg, "custom-capable")
+        self.assertEqual(
+            server._configured_model_dependency_aliases(
+                cfg, "custom-capable", image_body, "responses", route=incapable_route
+            ),
+            ["image-fallback"],
+        )
+        self.assertTrue(server._requires_media_routing(image_body, incapable_route))
+
+        cfg.model_mapping["custom-capable"]["capabilities"] = {
+            "vision": False,
+            "image_generation": True,
+        }
+        edit_capable_route = resolve_route(cfg, "custom-capable")
+        self.assertEqual(
+            server._configured_model_dependency_aliases(
+                cfg, "custom-capable", image_body, "responses", route=edit_capable_route
+            ),
+            [],
+        )
+        self.assertFalse(server._requires_media_routing(image_body, edit_capable_route))
+
+        vision_body = {
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "what is in this image?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,c291cmNl"},
+                ],
+            }],
+        }
+        self.assertEqual(
+            server._configured_model_dependency_aliases(
+                cfg, "custom-capable", vision_body, "responses", route=edit_capable_route
+            ),
+            ["vision-fallback"],
+        )
+        self.assertTrue(server._requires_media_routing(vision_body, edit_capable_route))
 
     def test_native_header_allowlist_injects_host_credentials(self):
         config = FakeConfig()

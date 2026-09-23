@@ -130,16 +130,15 @@ def test_authentication_rejects_missing_wrong_disabled_and_empty_store(tmp_path)
     assert caught.value.status_code == 503
 
 
-def test_model_permissions_are_exact_and_wildcard_is_explicit(tmp_path):
+def test_existing_key_can_use_new_models_without_updating_permissions(tmp_path):
     config = FakeConfig(tmp_path / "access-keys.json")
     restricted_key, _ = _created_key(config)
     wildcard_key, _ = get_access_key_store(config).create("all", ["*"])
 
     restricted = authenticate_bridge_headers(_bearer(restricted_key), config)
     require_model_access(restricted, "gpt-5.6-sol")
-    with pytest.raises(BridgeAccessError) as caught:
-        require_model_access(restricted, "gpt-5.6-sol-preview")
-    assert caught.value.status_code == 403
+    require_model_access(restricted, "gpt-6-sol")
+    assert restricted.allowed_models == ("*",)
 
     wildcard = authenticate_bridge_headers(_bearer(wildcard_key), config)
     require_model_access(wildcard, "deepseek-v4-pro")
@@ -168,37 +167,19 @@ def test_all_openai_compatible_http_endpoints_require_a_key(tmp_path):
                 assert response.headers["www-authenticate"] == "Bearer"
 
 
-def test_model_denial_happens_before_route_or_upstream_resolution(tmp_path):
-    config = FakeConfig(tmp_path / "access-keys.json")
-    raw_key, _ = _created_key(config)
-
-    with patch.object(server, "get_config", return_value=config), patch(
-        "code_cn_bridge.config.get_config", return_value=config
-    ), patch.object(
-        server, "_setup_logging"
-    ), patch.object(server, "resolve_route") as resolve_route, patch.object(
-        server, "get_stats", return_value=Mock()
-    ):
-        with TestClient(server.create_app()) as client:
-            response = client.post(
-                "/v1/responses",
-                headers=_bearer(raw_key),
-                json={"model": "deepseek-v4-pro", "input": [], "stream": False},
-            )
-
-    assert response.status_code == 403
-    assert response.json()["error"]["type"] == "bridge_model_permission_error"
-    resolve_route.assert_not_called()
-
-
-def test_models_catalog_is_filtered_to_key_permissions(tmp_path):
+def test_models_catalog_exposes_all_models_to_valid_key(tmp_path):
     config = FakeConfig(tmp_path / "access-keys.json")
     raw_key, _ = _created_key(config)
     merged = JSONResponse({
+        "object": "list",
         "models": [
             {"slug": "gpt-5.6-sol"},
             {"slug": "deepseek-v4-pro"},
-        ]
+        ],
+        "data": [
+            {"id": "gpt-5.6-sol", "object": "model"},
+            {"id": "deepseek-v4-pro", "object": "model"},
+        ],
     })
 
     with patch.object(server, "get_config", return_value=config), patch(
@@ -212,7 +193,8 @@ def test_models_catalog_is_filtered_to_key_permissions(tmp_path):
             response = client.get("/v1/models", headers=_bearer(raw_key))
 
     assert response.status_code == 200
-    assert [item["slug"] for item in response.json()["models"]] == ["gpt-5.6-sol"]
+    assert [item["slug"] for item in response.json()["models"]] == ["gpt-5.6-sol", "deepseek-v4-pro"]
+    assert [item["id"] for item in response.json()["data"]] == ["gpt-5.6-sol", "deepseek-v4-pro"]
 
 
 def test_admin_crud_returns_plaintext_only_on_create_and_rotate(tmp_path):
@@ -243,7 +225,8 @@ def test_admin_crud_returns_plaintext_only_on_create_and_rotate(tmp_path):
     assert "key" not in listed["keys"][0]
     assert "key_hash" not in listed["keys"][0]
     assert updated["name"] == "renamed"
-    assert updated["allowed_models"] == ["deepseek-v4-pro"]
+    assert created["record"]["allowed_models"] == ["*"]
+    assert updated["allowed_models"] == ["*"]
     assert rotated["key"].startswith(ACCESS_KEY_PREFIX)
     assert rotated["key"] != raw_key
     assert "key_hash" not in rotated["record"]
@@ -304,9 +287,8 @@ def test_websocket_authenticates_connection_and_authorizes_every_frame(tmp_path)
                     "model": "deepseek-v4-pro",
                     "generate": False,
                 })
-                denied = websocket.receive_json()
-                assert denied["type"] == "error"
-                assert denied["status"] == 403
+                assert websocket.receive_json()["type"] == "response.created"
+                assert websocket.receive_json()["type"] == "response.completed"
 
                 websocket.send_json({
                     "type": "response.create",

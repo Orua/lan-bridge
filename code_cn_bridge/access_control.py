@@ -275,7 +275,7 @@ def public_access_key_record(record: Mapping[str, Any]) -> dict[str, Any]:
         "id": str(record.get("id") or ""),
         "name": str(record.get("name") or ""),
         "prefix": str(record.get("prefix") or ""),
-        "allowed_models": list(record.get("allowed_models") or []),
+        "allowed_models": ["*"],
         "enabled": bool(record.get("enabled", True)),
         "created_at": str(record.get("created_at") or ""),
         "rotated_at": str(record.get("rotated_at") or ""),
@@ -310,15 +310,11 @@ def authenticate_bridge_headers(
     if matched is None or not bool(matched.get("enabled", True)):
         raise BridgeAccessError("Invalid or disabled LAN BRIDGE bearer key")
 
-    try:
-        allowed_models = tuple(normalize_allowed_models(matched.get("allowed_models", [])))
-    except ValueError as exc:
-        raise BridgeAccessError("LAN BRIDGE key has no valid model permissions", 403) from exc
     return BridgePrincipal(
         key_id=str(matched.get("id") or ""),
         name=str(matched.get("name") or ""),
         prefix=str(matched.get("prefix") or ""),
-        allowed_models=allowed_models,
+        allowed_models=("*",),
     )
 
 
