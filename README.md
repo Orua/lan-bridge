@@ -217,7 +217,7 @@ Use these values after LAN BRIDGE is running:
 ```text
 Base URL: http://127.0.0.1:8765/v1
 API key: a LAN BRIDGE access key created in the desktop Access Keys page
-Model: any model for an unrestricted key, or an explicitly allowed alias
+Model: a configured custom alias or any native model ID available to the host account
 ```
 
 For a client on another trusted LAN device, use
@@ -331,11 +331,26 @@ are never used as the bridge credential. LAN BRIDGE does not implement its own
 OAuth refresh endpoint; Codex refreshes its cache during normal use. If the
 cached access token expires, use Codex on the bridge computer or sign in again.
 
+### Live account model catalog and timing
+
+The model library and authenticated `GET /v1/models` query the host's ChatGPT
+account catalog. The bridge uses the host Codex client version, so an older
+downstream client cannot hide newer models. Both the rich Codex `models` array
+and the OpenAI-compatible `data` array are returned. A successful inference turn
+verifies access; a catalog entry alone is not an entitlement check. If the
+account catalog is unavailable, the model library labels its configured fallback.
+
+The `first_response_ms` log field measures receipt of the first upstream stream
+bytes locally; it does not depend on official timing headers and is not a
+first-visible-token measurement. A client cancellation is logged as 499;
+upstream failure events, transport failures, or a stream without a terminal
+event are logged as 502. Original native SSE bytes are forwarded unchanged.
+
 ### Access keys and usage
 
 The desktop **Access Keys** page creates, disables, rotates, and deletes bridge
-keys, and assigns each key an explicit list of model aliases (or all configured
-models). The raw key is shown exactly once after creation or rotation, so copy
+keys. Valid enabled keys can request any model ID; upstream account or provider
+access determines availability. The raw key is shown exactly once after creation or rotation, so copy
 it to the client environment immediately. The bridge records a small local
 summary of request count and input/output/total tokens per key; it does not
 store prompts or upstream login tokens in that summary.

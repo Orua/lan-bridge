@@ -34,7 +34,7 @@ from .stats import get_stats, RequestLog
 from .client import UpstreamClient
 from .http_utils import make_async_client, make_provider_async_client
 from .native_proxy import custom_model_context_settings, fetch_merged_models, merge_model_catalog
-from .codex_auth import resolve_auth_file
+from .codex_auth import NativeAuthError, native_auth_injection_enabled, resolve_auth_file
 from .access_control import (
     BridgeAccessError,
     access_control_enabled,
@@ -251,11 +251,13 @@ async def list_models(request: Request):
     mapping = cfg.model_mapping
 
     native_entries = dict(cfg.native_models)
-    if native_entries:
+    catalog_status = {"source": "configured", "available": False}
+    if native_auth_injection_enabled(cfg) or native_entries:
         try:
             response = await fetch_merged_models(request, cfg)
             if response.status_code == 200:
                 payload = json.loads(response.body)
+                catalog_status = payload.get("native_catalog") or {"source": "account", "available": True}
                 for item in payload.get("models", []):
                     if not isinstance(item, dict):
                         continue
@@ -270,7 +272,7 @@ async def list_models(request: Request):
                         "display_name": item.get("display_name") or alias,
                         "description": item.get("description") or "OpenAI Codex native model",
                     }
-        except (ValueError, httpx.HTTPError) as exc:
+        except (ValueError, httpx.HTTPError, NativeAuthError) as exc:
             logger.debug("Native model catalog unavailable for admin list: %s", exc)
 
     models = []
@@ -349,7 +351,7 @@ async def list_models(request: Request):
             "is_reasoning_text": entry.get("is_reasoning_text", False),
             "available_adapters": reg.list(),
         })
-    return {"models": models}
+    return {"models": models, "native_catalog": catalog_status}
 
 
 @router.post("/models")

@@ -515,11 +515,11 @@ class UnifiedRoutingTests(unittest.TestCase):
         })
         client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-        with patch("code_cn_bridge.native_proxy._native_client", return_value=client):
+        with patch("code_cn_bridge.native_proxy._host_catalog_client_version", return_value="0.162.0"), patch("code_cn_bridge.native_proxy._native_client", return_value=client):
             response = asyncio.run(fetch_merged_models(request, FakeConfig()))
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(observed["client_version"], "0.0.0")
+        self.assertEqual(observed["client_version"], "0.162.0")
 
     def test_models_proxy_also_returns_openai_compatible_model_list(self):
         def handler(request: httpx.Request) -> httpx.Response:

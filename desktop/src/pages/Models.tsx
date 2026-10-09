@@ -46,10 +46,12 @@ const Models: React.FC = () => {
   const [baseCapabilities, setBaseCapabilities] = useState<Record<string, unknown>>({});
   const [busy, setBusy] = useState('');
   const [result, setResult] = useState<TestResult | null>(null);
+  const [catalogAvailable, setCatalogAvailable] = useState<boolean | null>(null);
 
   const load = async () => {
     const [modelResult, slotResult] = await Promise.all([api.getModels(), api.getSlots()]);
     setModels(modelResult.models || []);
+    setCatalogAvailable(Boolean(modelResult.native_catalog?.available));
     setSlots(slotResult.slots || []);
   };
 
@@ -166,8 +168,8 @@ const Models: React.FC = () => {
 
       <section className="library-section native-section">
         <div className="section-heading">
-          <div><h3>{tl(['官方 Codex 模型', 'Official Codex models'])}</h3><p>{tl(['只读，使用 ChatGPT 登录态原生透传', 'Read-only, native passthrough using ChatGPT authentication'])}</p></div>
-          <span className="route-pill native">NATIVE</span>
+          <div><h3>{tl(['官方 Codex 模型', 'Official Codex models'])}</h3><p>{catalogAvailable === false ? tl(['账号模型目录暂不可用，当前显示配置项', 'Account catalog unavailable; showing configured entries']) : tl(['从当前 ChatGPT 账号获取，新增模型自动出现在下游模型接口', 'Fetched from the current ChatGPT account; new models appear in the downstream catalog'])}</p></div>
+          <button className="btn btn-sm" disabled={Boolean(busy)} onClick={async () => { setBusy('catalog'); try { await load(); } finally { setBusy(''); } }}>{busy === 'catalog' ? tl(['刷新中...', 'Refreshing...']) : tl(['刷新账号模型', 'Refresh account models'])}</button>
         </div>
         <div className="library-grid">
           {official.map(model => <article className="library-card native-card" key={model.alias}>

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import copy
+import asyncio
 import hashlib
 import json
 import re
+import shutil
+import subprocess
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from typing import Any
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -17,10 +21,12 @@ from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
 from .http_utils import make_native_async_client
+from .sse_observer import SSEJsonObserver
 from .codex_auth import (
     NativeAuthError,
     load_native_credentials,
     native_auth_injection_enabled,
+    resolve_auth_file,
 )
 
 
@@ -39,6 +45,46 @@ _NATIVE_CONTEXT_CACHE_TTL_SECONDS = 2 * 60 * 60
 _NATIVE_CONTEXT_CACHE: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
 _NATIVE_CONTEXT_CACHE_BYTES = 0
 _RESPONSE_CONTEXT_OWNERS: dict[str, tuple[str, str]] = {}
+_CATALOG_VERSION_CACHE: tuple[float, str] = (0.0, "")
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)", value)
+    return tuple(map(int, match.groups())) if match else (0, 0, 0)
+
+
+def _host_catalog_client_version(config) -> str:
+    """Use the current host's Codex version, never a legacy downstream's catalog gate."""
+    global _CATALOG_VERSION_CACHE
+    server = getattr(config, "data", {}).get("server", {})
+    override = str(server.get("native_catalog_client_version") or "")
+    if _version_tuple(override) != (0, 0, 0):
+        return ".".join(map(str, _version_tuple(override)))
+    versions: list[tuple[int, int, int]] = []
+    for cache_path in {resolve_auth_file(config).parent / "models_cache.json", Path.home() / ".codex/models_cache.json"}:
+        try:
+            if cache_path.stat().st_size <= 4 * 1024 * 1024:
+                payload = json.loads(cache_path.read_text(encoding="utf-8-sig"))
+                versions.append(_version_tuple(str(payload.get("client_version") or "")))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    now = time.monotonic()
+    if now - _CATALOG_VERSION_CACHE[0] >= 300 or not _CATALOG_VERSION_CACHE[1]:
+        executable = shutil.which("codex")
+        version = ""
+        if executable:
+            try:
+                completed = subprocess.run(
+                    [executable, "--version"], capture_output=True, text=True,
+                    timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if completed.returncode == 0:
+                    version = ".".join(map(str, _version_tuple(completed.stdout)))
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _CATALOG_VERSION_CACHE = (now, version or "0.0.0")
+    versions.append(_version_tuple(_CATALOG_VERSION_CACHE[1]))
+    return ".".join(map(str, max(versions)))
 FORWARD_REQUEST_HEADERS = frozenset({
     "authorization",
     "chatgpt-account-id",
@@ -586,18 +632,16 @@ async def proxy_native_responses(
             ).encode("utf-8"),
         )
 
-    upstream_request = build_upstream_request()
     try:
+        upstream_request = build_upstream_request()
         upstream = await client.send(upstream_request, stream=True)
     except Exception:
         await client.aclose()
         raise
 
     if upstream.status_code >= 400:
-        error_body = await upstream.aread()
-
-    if upstream.status_code >= 400:
         try:
+            error_body = await upstream.aread()
             raise NativeUpstreamHTTPError(
                 upstream.status_code,
                 error_body,
@@ -610,79 +654,73 @@ async def proxy_native_responses(
     headers = _response_headers(upstream.headers)
 
     async def stream_bytes() -> AsyncIterator[bytes]:
-        pending = b""
+        observer = SSEJsonObserver()
         traced_response_ids: set[str] = set()
         completed_output_items: list[Any] = []
         completed = False
+        failed = False
+        cancelled = False
+        first_chunk = True
+        stream_error = ""
         usage_fields: dict[str, Any] = {}
+
+        def observe(event: dict[str, Any]) -> None:
+            nonlocal completed, failed, stream_error, usage_fields
+            response = event.get("response")
+            response = response if isinstance(response, dict) else {}
+            response_id = response.get("id")
+            event_type = event.get("type")
+            if event_type == "response.output_item.done" and isinstance(event.get("item"), dict):
+                completed_output_items.append(event["item"])
+            if on_trace is not None and isinstance(response_id, str) and response_id not in traced_response_ids:
+                traced_response_ids.add(response_id)
+                on_trace("response_id", {"response_id": response_id, "event_type": event_type})
+            if event_type in {"error", "response.failed", "response.incomplete"}:
+                failed = True
+                detail = response.get("error") or event.get("error") or response.get("incomplete_details") or {}
+                if isinstance(detail, dict):
+                    stream_error = str(detail.get("message") or detail.get("reason") or detail.get("code") or event.get("message") or event_type)
+                else:
+                    stream_error = str(detail or event.get("message") or event_type)
+                stream_error = stream_error[:_MAX_UPSTREAM_ERROR_DETAIL]
+                usage_fields = _usage_trace_fields(response)
+            if upstream_path == "responses" and event_type == "response.completed" and isinstance(response_id, str):
+                completed = True
+                usage_fields = _usage_trace_fields(response)
+                response_output = response.get("output")
+                output_items = response_output if isinstance(response_output, list) and response_output else completed_output_items
+                if on_trace is not None:
+                    on_trace("completed_output", {
+                        **usage_fields,
+                        "output_items": len(output_items),
+                        "output_types": [item.get("type", "") for item in output_items if isinstance(item, dict)],
+                    })
+                _native_context_put(response_id, upstream_payload.get("input", []), output_items, access_key_id=access_key_id)
+
         try:
             async for chunk in upstream.aiter_raw():
-                if on_trace is not None or upstream_path == "responses":
-                    pending += chunk
-                    lines = pending.split(b"\n")
-                    pending = lines.pop()
-                    for line in lines:
-                        if not line.startswith(b"data:"):
-                            continue
-                        raw_event = line[5:].strip()
-                        if not raw_event or raw_event == b"[DONE]":
-                            continue
-                        try:
-                            event = json.loads(raw_event)
-                        except (TypeError, ValueError):
-                            continue
-                        response = event.get("response") if isinstance(event, dict) else None
-                        response_id = response.get("id") if isinstance(response, dict) else None
-                        if (
-                            isinstance(event, dict)
-                            and event.get("type") == "response.output_item.done"
-                            and isinstance(event.get("item"), dict)
-                        ):
-                            completed_output_items.append(event["item"])
-                        if (
-                            on_trace is not None
-                            and isinstance(response_id, str)
-                            and response_id not in traced_response_ids
-                        ):
-                            traced_response_ids.add(response_id)
-                            on_trace(
-                                "response_id",
-                                {"response_id": response_id, "event_type": event.get("type", "")},
-                            )
-                        if (
-                            upstream_path == "responses"
-                            and isinstance(response, dict)
-                            and event.get("type") == "response.completed"
-                            and isinstance(response_id, str)
-                        ):
-                            completed = True
-                            usage_fields = _usage_trace_fields(response)
-                            response_output = response.get("output")
-                            output_items = (
-                                response_output
-                                if isinstance(response_output, list) and response_output
-                                else completed_output_items
-                            )
-                            if on_trace is not None:
-                                on_trace("completed_output", {
-                                    **usage_fields,
-                                    "output_items": len(output_items),
-                                    "output_types": [
-                                        item.get("type", "")
-                                        for item in output_items
-                                        if isinstance(item, dict)
-                                    ],
-                                })
-                            _native_context_put(
-                                response_id,
-                                upstream_payload.get("input", []),
-                                output_items,
-                                access_key_id=access_key_id,
-                            )
+                if chunk and first_chunk:
+                    first_chunk = False
+                    if on_trace is not None:
+                        on_trace("first_chunk", {})
+                for event in observer.feed(chunk):
+                    observe(event)
                 yield chunk
+            for event in observer.finish():
+                observe(event)
+            if not completed and not failed and upstream_path == "responses":
+                failed = True
+                stream_error = "Upstream Responses stream ended without a terminal event"
+        except (asyncio.CancelledError, GeneratorExit):
+            cancelled = True
+            raise
+        except Exception as exc:
+            failed = True
+            stream_error = str(exc)[:_MAX_UPSTREAM_ERROR_DETAIL] or type(exc).__name__
+            raise
         finally:
             if on_trace is not None:
-                on_trace("stream_finished", {"completed": completed, **usage_fields})
+                on_trace("stream_finished", {"completed": completed, "failed": failed, "cancelled": cancelled, "error": stream_error, **usage_fields})
             await upstream.aclose()
             await client.aclose()
 
@@ -697,6 +735,8 @@ async def proxy_native_responses(
 
     try:
         content = await upstream.aread()
+        if on_trace is not None:
+            on_trace("first_chunk", {})
         if upstream_path == "responses":
             try:
                 payload = json.loads(content)
@@ -981,12 +1021,11 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
 async def fetch_merged_models(request: Request, config) -> Response:
     client = _native_client(config, httpx.Timeout(10.0, connect=5.0))
     url = f"{_native_base_url(config)}/models"
-    query = list(request.query_params.multi_items())
-    if not any(name == "client_version" for name, _ in query):
-        # The native catalog requires this Codex-specific query field, while
-        # ordinary OpenAI-compatible clients correctly call /v1/models without
-        # it.  Supplying a neutral value keeps both client styles compatible.
-        query.append(("client_version", "0.0.0"))
+    host_version = await asyncio.to_thread(_host_catalog_client_version, config)
+    requested_version = request.query_params.get("client_version", "")
+    catalog_version = ".".join(map(str, max(_version_tuple(host_version), _version_tuple(requested_version))))
+    query = [(name, value) for name, value in request.query_params.multi_items() if name not in {"client_version", "refresh"}]
+    query.append(("client_version", catalog_version))
     try:
         upstream = await client.get(
             url,
@@ -996,6 +1035,7 @@ async def fetch_merged_models(request: Request, config) -> Response:
         if upstream.is_success:
             native_payload = upstream.json()
             merged = merge_model_catalog(native_payload, config)
+            merged["native_catalog"] = {"source": "account", "client_version": catalog_version, "available": True}
             headers = _response_headers(upstream.headers)
             headers.pop("content-type", None)
             return Response(
@@ -1020,6 +1060,7 @@ async def fetch_merged_models(request: Request, config) -> Response:
                 if str(model.get("slug") or "") in custom_aliases
             ]
             fallback = add_openai_model_list(fallback)
+            fallback["native_catalog"] = {"source": "configured", "client_version": catalog_version, "available": False, "upstream_status": upstream.status_code}
             headers = _response_headers(upstream.headers)
             headers.pop("content-type", None)
             return Response(

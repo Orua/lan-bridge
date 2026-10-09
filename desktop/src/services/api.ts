@@ -19,7 +19,7 @@ export const api = {
   getStatus: () => request<ProxyStatus>('/admin/api/status'),
 
   // 模型 CRUD
-  getModels: () => request<{ models: ModelConfig[] }>('/admin/api/models'),
+  getModels: () => request<{ models: ModelConfig[]; native_catalog?: { source: string; available: boolean; client_version?: string } }>('/admin/api/models'),
   addModel: (data: Record<string, unknown>) =>
     request<{ status: string }>('/admin/api/models', {
       method: 'POST',

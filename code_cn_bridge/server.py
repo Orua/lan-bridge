@@ -4102,6 +4102,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                 native_tokens = 0
                 native_finished = False
                 native_recorded = False
+                native_first_response_ms = None
 
                 def record_native(status_code: int = 200, error: str = "") -> None:
                     nonlocal native_recorded
@@ -4119,6 +4120,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                         provider="native_codex",
                         target_model=target_model,
                         client_ip=request_client_ip,
+                        first_response_ms=native_first_response_ms,
+                        input_tools=_responses_tool_summary(body.get("tools")),
                     )
 
                 input_items = body.get("input", []) or []
@@ -4140,15 +4143,19 @@ def create_app(verbose: bool = False) -> FastAPI:
                     ],
                 )
                 def trace_native(event: str, fields: dict) -> None:
-                    nonlocal native_tokens, native_finished
+                    nonlocal native_tokens, native_finished, native_first_response_ms
                     trace_fields = dict(fields)
+                    if event == "first_chunk" and native_first_response_ms is None:
+                        native_first_response_ms = (time.time() - start_time) * 1000
+                        trace_fields["first_response_ms"] = native_first_response_ms
                     if isinstance(trace_fields.get("tokens"), int):
                         native_tokens = trace_fields["tokens"]
                     if event == "stream_finished":
                         native_finished = bool(trace_fields.get("completed"))
+                        status = 502 if trace_fields.get("failed") else 200 if native_finished else 499
                         record_native(
-                            200 if native_finished else 499,
-                            "" if native_finished else "Client disconnected before upstream Responses completion",
+                            status,
+                            "" if status == 200 else str(trace_fields.get("error") or "Client disconnected before upstream Responses completion"),
                         )
                     response_id = trace_fields.pop("response_id", "")
                     if response_id:
@@ -4924,24 +4931,32 @@ def create_app(verbose: bool = False) -> FastAPI:
                 tool_count=len(body.get("tools") or []) if isinstance(body.get("tools"), list) else 0,
             )
             native_recorded = False
+            native_chat_first_response_ms = None
+            native_chat_stream_error = {}
 
             def trace_native_chat(event: str, fields: dict[str, Any]) -> None:
-                nonlocal native_recorded
+                nonlocal native_recorded, native_chat_first_response_ms, native_chat_stream_error
                 trace_fields = dict(fields)
+                if event == "native_first_chunk" and native_chat_first_response_ms is None:
+                    native_chat_first_response_ms = (time.time() - start_time) * 1000
+                    trace_fields["first_response_ms"] = native_chat_first_response_ms
+                if event == "native_stream_finished":
+                    native_chat_stream_error = trace_fields
                 if event == "stream_finished" and not native_recorded:
                     native_recorded = True
-                    status = 502 if trace_fields.get("failed") else 200 if trace_fields.get("completed") else 499
+                    status = 502 if trace_fields.get("failed") or native_chat_stream_error.get("failed") else 200 if trace_fields.get("completed") else 499
                     _record_request(
                         start_time,
                         model,
                         "chat",
                         status,
                         True,
-                        "" if status == 200 else "Native Responses stream ended before completion",
+                        "" if status == 200 else str(native_chat_stream_error.get("error") or "Native Responses stream ended before completion"),
                         int(trace_fields.get("tokens") or 0),
                         provider="native_codex",
                         target_model=target_model,
                         upstream_api="responses",
+                        first_response_ms=native_chat_first_response_ms,
                     )
                 _audit_event(f"chat.responses_{event}", request_id, **trace_fields)
 
@@ -4976,6 +4991,7 @@ def create_app(verbose: bool = False) -> FastAPI:
                         provider="native_codex",
                         target_model=target_model,
                         upstream_api="responses",
+                        first_response_ms=native_chat_first_response_ms,
                     )
                 return _bind_stream_principal(response, principal)
             except ChatToResponsesConversionError as exc:

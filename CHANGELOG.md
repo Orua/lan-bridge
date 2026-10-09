@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.12 — 2026-10-10
+
+- Discover the live ChatGPT account catalog using the host Codex version, so older downstream clients no longer hide new models such as `gpt-6.1-sol`.
+- Show account catalog availability and provide a refresh action in the model library; retain both Codex and OpenAI-compatible model list formats.
+- Record native Responses and native Chat first-response latency locally, independent of upstream timing headers.
+- Distinguish client cancellations from upstream failures, incomplete responses, and truncated streams; recognize final SSE events without a trailing newline while forwarding original bytes unchanged.
+- Close native HTTP clients when credential preparation or upstream error-body reads fail.
+- Validation: 338 Python tests and 6 subtests, desktop typecheck/build and 11 Electron tests; live `gpt-6.1-sol` Responses tool/context roundtrip, Chat Completions, and streamed command tasks plus same-session followups on local and 113 Agents passed. The deployed runtime reports 0.2.12 and records native first-response timing.
+
 ## 0.2.11 — 2026-09-23
 
 ### Changed
