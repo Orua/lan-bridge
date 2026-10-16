@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator, Callable
@@ -13,6 +14,8 @@ from fastapi.responses import Response, StreamingResponse
 
 from .adapters.base import BaseAdapter
 from .http_utils import make_provider_async_client as make_async_client
+from .http_utils import close_http_client
+from .sse_observer import SSEJsonObserver
 from .native_proxy import (
     _native_context_put,
     _response_headers,
@@ -225,72 +228,93 @@ async def proxy_provider_responses(
         proxy_url=proxy_url,
         timeout=httpx.Timeout(stream_timeout, connect=30.0),
     )
-    request = client.build_request(
-        "POST",
-        _responses_url(adapter),
-        headers=_provider_headers(adapter, api_key),
-        content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-    )
     try:
+        request = client.build_request(
+            "POST",
+            _responses_url(adapter),
+            headers=_provider_headers(adapter, api_key),
+            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
         upstream = await client.send(request, stream=True)
-    except Exception:
-        await client.aclose()
+    except BaseException:
+        await close_http_client(client)
         raise
 
     if upstream.status_code >= 400:
-        error_body = await upstream.aread()
         try:
+            error_body = await upstream.aread()
             raise ProviderResponsesHTTPError(provider_name, upstream.status_code, error_body)
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            await close_http_client(client, upstream)
 
     headers = _response_headers(upstream.headers)
 
     async def stream_bytes() -> AsyncIterator[bytes]:
-        pending = b""
+        observer = SSEJsonObserver()
         output_items: list[Any] = []
         completed = False
+        failed = False
+        cancelled = False
+        first_chunk = True
+        stream_error = ""
         usage_fields: dict[str, Any] = {}
+
+        def observe(event: dict[str, Any]) -> None:
+            nonlocal completed, failed, stream_error, usage_fields
+            if event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
+                output_items.append(event["item"])
+            response = event.get("response")
+            response = response if isinstance(response, dict) else {}
+            if event.get("type") in {"error", "response.failed", "response.incomplete"}:
+                failed = True
+                detail = response.get("error") or event.get("error") or response.get("incomplete_details") or {}
+                if isinstance(detail, dict):
+                    detail = detail.get("message") or detail.get("reason") or detail.get("code")
+                stream_error = str(detail or event.get("message") or event.get("type"))[:_MAX_UPSTREAM_ERROR_DETAIL]
+                usage_fields = _usage_trace_fields(response)
+            if event.get("type") == "response.completed":
+                completed = True
+                usage_fields = _usage_trace_fields(response)
+                response_id = response.get("id")
+                completed_output = response.get("output")
+                if isinstance(response_id, str):
+                    _native_context_put(
+                        response_id,
+                        payload.get("input", []) if isinstance(payload.get("input"), list) else [],
+                        completed_output if isinstance(completed_output, list) and completed_output else output_items,
+                        owner=provider_name,
+                        access_key_id=access_key_id,
+                    )
+                    if on_trace is not None:
+                        on_trace("completed", {"response_id": response_id, **usage_fields})
+
         try:
             async for chunk in upstream.aiter_raw():
-                pending += chunk
-                lines = pending.split(b"\n")
-                pending = lines.pop()
-                for line in lines:
-                    if not line.startswith(b"data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw or raw == b"[DONE]":
-                        continue
-                    try:
-                        event = json.loads(raw)
-                    except (TypeError, ValueError):
-                        continue
-                    if event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
-                        output_items.append(event["item"])
-                    response = event.get("response")
-                    if event.get("type") == "response.completed" and isinstance(response, dict):
-                        completed = True
-                        usage_fields = _usage_trace_fields(response)
-                        response_id = response.get("id")
-                        completed_output = response.get("output")
-                        if isinstance(response_id, str):
-                            _native_context_put(
-                                response_id,
-                                payload.get("input", []) if isinstance(payload.get("input"), list) else [],
-                                completed_output if isinstance(completed_output, list) and completed_output else output_items,
-                                owner=provider_name,
-                                access_key_id=access_key_id,
-                            )
-                            if on_trace is not None:
-                                on_trace("completed", {"response_id": response_id, **usage_fields})
+                if chunk and first_chunk:
+                    first_chunk = False
+                    if on_trace is not None:
+                        on_trace("first_chunk", {})
+                for event in observer.feed(chunk):
+                    observe(event)
                 yield chunk
+            for event in observer.finish():
+                observe(event)
+            if not completed and not failed:
+                failed = True
+                stream_error = "Upstream Responses stream ended without a terminal event"
+        except (asyncio.CancelledError, GeneratorExit):
+            cancelled = True
+            raise
+        except Exception as exc:
+            failed = True
+            stream_error = str(exc)[:_MAX_UPSTREAM_ERROR_DETAIL] or type(exc).__name__
+            raise
         finally:
-            if on_trace is not None:
-                on_trace("stream_finished", {"completed": completed, **usage_fields})
-            await upstream.aclose()
-            await client.aclose()
+            try:
+                if on_trace is not None:
+                    on_trace("stream_finished", {"completed": completed, "failed": failed, "cancelled": cancelled, "error": stream_error, **usage_fields})
+            finally:
+                await close_http_client(client, upstream)
 
     content_type = upstream.headers.get("content-type", "")
     if "text/event-stream" in content_type or body.get("stream"):
@@ -322,8 +346,7 @@ async def proxy_provider_responses(
                 on_trace("completed", _usage_trace_fields(response_payload))
         return Response(content=content, status_code=upstream.status_code, headers=headers, media_type=None)
     finally:
-        await upstream.aclose()
-        await client.aclose()
+        await close_http_client(client, upstream)
 
 
 async def proxy_chat_to_responses(
@@ -383,25 +406,24 @@ async def proxy_chat_to_responses(
         proxy_url=proxy_url,
         timeout=httpx.Timeout(stream_timeout if payload.get("stream") else timeout_seconds, connect=30.0),
     )
-    request = client.build_request(
-        "POST",
-        _responses_url(adapter),
-        headers=_provider_headers(adapter, api_key),
-        content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-    )
     try:
+        request = client.build_request(
+            "POST",
+            _responses_url(adapter),
+            headers=_provider_headers(adapter, api_key),
+            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
         upstream = await client.send(request, stream=True)
-    except Exception:
-        await client.aclose()
+    except BaseException:
+        await close_http_client(client)
         raise
 
     if upstream.status_code >= 400:
-        error_body = await upstream.aread()
         try:
+            error_body = await upstream.aread()
             raise ChatToResponsesHTTPError(provider_name, upstream.status_code, error_body)
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            await close_http_client(client, upstream)
 
     headers = _response_headers(upstream.headers)
     if payload.get("stream") or "text/event-stream" in upstream.headers.get("content-type", ""):
@@ -421,8 +443,7 @@ async def proxy_chat_to_responses(
                         },
                     )
             finally:
-                await upstream.aclose()
-                await client.aclose()
+                await close_http_client(client, upstream)
 
         headers.pop("content-type", None)
         headers["Cache-Control"] = "no-cache, no-transform"
@@ -447,8 +468,7 @@ async def proxy_chat_to_responses(
             media_type="application/json",
         )
     finally:
-        await upstream.aclose()
-        await client.aclose()
+        await close_http_client(client, upstream)
 
 
 async def proxy_chat_to_native_responses(
@@ -462,6 +482,8 @@ async def proxy_chat_to_native_responses(
     request_id: str = "",
     access_key_id: str = "",
     on_trace: Callable[[str, dict[str, Any]], None] | None = None,
+    prepare_payload: Callable[[dict], None] | None = None,
+    image_renderer: Callable[[dict], str] | None = None,
 ) -> Response:
     """Expose an official native Responses model through Chat Completions."""
     client_wants_stream = bool(body.get("stream", False))
@@ -472,6 +494,8 @@ async def proxy_chat_to_native_responses(
         model_entry=model_entry,
         on_drop=dropped.append,
     )
+    if prepare_payload is not None:
+        prepare_payload(payload)
     # The official Codex backend only serves Responses as SSE and rejects the
     # public max_output_tokens field. Non-streaming Chat clients are aggregated
     # locally after the upstream stream has completed.
@@ -519,7 +543,7 @@ async def proxy_chat_to_native_responses(
         original_iterator = upstream_response.body_iterator
 
         if not client_wants_stream:
-            translator = ResponsesStreamToChat(chat_model, request_id)
+            translator = ResponsesStreamToChat(chat_model, request_id, image_renderer=image_renderer)
             try:
                 chat_response = await _collect_chat_response_from_responses_stream(
                     translator,
@@ -542,7 +566,7 @@ async def proxy_chat_to_native_responses(
             )
 
         async def stream_chat() -> AsyncIterator[str]:
-            translator = ResponsesStreamToChat(chat_model, request_id)
+            translator = ResponsesStreamToChat(chat_model, request_id, image_renderer=image_renderer)
             try:
                 async for chunk in translator.convert(original_iterator):
                     yield chunk
@@ -571,7 +595,10 @@ async def proxy_chat_to_native_responses(
         response_payload = json.loads(upstream_response.body or b"{}")
     except (TypeError, ValueError) as exc:
         raise ResponsesToChatConversionError("Responses 上游返回了无效 JSON") from exc
-    chat_response = convert_responses_response_to_chat(response_payload, chat_model)
+    try:
+        chat_response = convert_responses_response_to_chat(response_payload, chat_model, image_renderer=image_renderer)
+    except (ValueError, OSError) as exc:
+        raise ResponsesToChatConversionError("图片生成结果交付失败") from exc
     if on_trace is not None:
         usage = chat_response.get("usage") or {}
         on_trace("completed", {"tokens": usage.get("total_tokens", 0)})

@@ -7,6 +7,17 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import anyio
+
+
+async def close_http_client(client: httpx.AsyncClient, response: httpx.Response | None = None) -> None:
+    """Release both resources even inside Starlette's cancelled stream scope."""
+    with anyio.CancelScope(shield=True):
+        try:
+            if response is not None:
+                await response.aclose()
+        finally:
+            await client.aclose()
 
 
 def _ssl_verify() -> str | ssl.SSLContext:

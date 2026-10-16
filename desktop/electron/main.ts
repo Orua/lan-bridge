@@ -205,10 +205,12 @@ function cancelBridgeStableTimer() {
 function startBridgeWatchdog() {
   if (bridgeWatchdogTimer) return;
   bridgeWatchdogTimer = setInterval(async () => {
-    if (bridgeWatchdogChecking || !bridgeDesiredRunning || isQuitting || bridgeStartInFlight) return;
+    if (bridgeWatchdogChecking || !bridgeDesiredRunning || isQuitting || bridgeStartInFlight || bridgeRestartTimer) return;
     bridgeWatchdogChecking = true;
     try {
-      if (await bridgeIsHealthy()) {
+      const healthy = await bridgeIsHealthy();
+      if (!bridgeDesiredRunning || isQuitting || bridgeStartInFlight || bridgeRestartTimer) return;
+      if (healthy) {
         bridgeHealthFailureCount = 0;
         return;
       }
@@ -261,11 +263,13 @@ function scheduleBridgeRestart() {
 }
 
 async function startBridgeProcess() {
-  if (!bridgeDesiredRunning || bridgeProcess || bridgeStartInFlight) return;
+  if (!bridgeDesiredRunning || isQuitting || bridgeProcess || bridgeStartInFlight) return;
   bridgeStartInFlight = true;
   cancelBridgeRestart();
   try {
-  if (await bridgeIsHealthy()) {
+  const healthy = await bridgeIsHealthy();
+  if (!bridgeDesiredRunning || isQuitting) return;
+  if (healthy) {
     bridgeOwnedByApp = false;
     bridgeRestartCount = 0;
     bridgeHealthFailureCount = 0;
@@ -274,7 +278,9 @@ async function startBridgeProcess() {
     safeSend('bridge-status', { running: true });
     return;
   }
-  if (await bridgePortIsOpen()) {
+  const portOpen = await bridgePortIsOpen();
+  if (!bridgeDesiredRunning || isQuitting) return;
+  if (portOpen) {
     const message = `端口 ${BRIDGE_PORT} 已被其他异常进程占用，未启动新的 Bridge。`;
     console.error(`[Main] ${message}`);
     safeSend('bridge-status', { running: false, error: message });
@@ -344,7 +350,9 @@ async function startBridgeProcess() {
     scheduleBridgeRestart();
   });
 
-  if (await waitForBridgeHealthy(child)) {
+  const startedHealthy = await waitForBridgeHealthy(child);
+  if (!bridgeDesiredRunning || isQuitting || bridgeProcess !== child) return;
+  if (startedHealthy) {
     bridgeHealthFailureCount = 0;
     safeSend('bridge-status', { running: true });
     writeDesktopLog('INFO', `Bridge 后端健康检查通过，pid=${child.pid || 'unknown'}`);

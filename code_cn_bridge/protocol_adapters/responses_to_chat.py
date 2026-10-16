@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 
@@ -50,6 +51,8 @@ def _incomplete_finish_reason(response: dict[str, Any]) -> str:
 def convert_responses_response_to_chat(
     response: dict[str, Any],
     chat_model: str,
+    *,
+    image_renderer: Callable[[dict], str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(response, dict):
         raise ResponsesToChatConversionError("Responses 上游返回的 JSON 顶层不是对象")
@@ -72,6 +75,10 @@ def convert_responses_response_to_chat(
             text_parts.append(_text_from_content(item.get("content")))
         elif item_type == "output_text":
             text_parts.append(str(item.get("text") or ""))
+        elif item_type == "image_generation_call":
+            if image_renderer is None:
+                raise ResponsesToChatConversionError("图片结果缺少可用的交付处理器")
+            text_parts.append(image_renderer(item))
         elif item_type == "function_call":
             call_id = str(item.get("call_id") or item.get("id") or "").strip()
             if not call_id:

@@ -20,7 +20,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
-from .http_utils import make_native_async_client
+from .http_utils import close_http_client, make_native_async_client
 from .sse_observer import SSEJsonObserver
 from .codex_auth import (
     NativeAuthError,
@@ -635,8 +635,8 @@ async def proxy_native_responses(
     try:
         upstream_request = build_upstream_request()
         upstream = await client.send(upstream_request, stream=True)
-    except Exception:
-        await client.aclose()
+    except BaseException:
+        await close_http_client(client)
         raise
 
     if upstream.status_code >= 400:
@@ -648,8 +648,7 @@ async def proxy_native_responses(
                 upstream.headers.get("content-type", ""),
             )
         finally:
-            await upstream.aclose()
-            await client.aclose()
+            await close_http_client(client, upstream)
 
     headers = _response_headers(upstream.headers)
 
@@ -719,10 +718,11 @@ async def proxy_native_responses(
             stream_error = str(exc)[:_MAX_UPSTREAM_ERROR_DETAIL] or type(exc).__name__
             raise
         finally:
-            if on_trace is not None:
-                on_trace("stream_finished", {"completed": completed, "failed": failed, "cancelled": cancelled, "error": stream_error, **usage_fields})
-            await upstream.aclose()
-            await client.aclose()
+            try:
+                if on_trace is not None:
+                    on_trace("stream_finished", {"completed": completed, "failed": failed, "cancelled": cancelled, "error": stream_error, **usage_fields})
+            finally:
+                await close_http_client(client, upstream)
 
     content_type = upstream.headers.get("content-type", "")
     if "text/event-stream" in content_type or body.get("stream"):
@@ -762,8 +762,7 @@ async def proxy_native_responses(
             media_type=None,
         )
     finally:
-        await upstream.aclose()
-        await client.aclose()
+        await close_http_client(client, upstream)
 
 
 def _optional_positive_int(value: Any) -> int | None:

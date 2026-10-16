@@ -24,13 +24,15 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import zstandard as zstd
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import __version__
+from .generated_images import generated_image_path, render_generated_image
 from .config import get_config, reload_config, reload_config_if_changed
 from .adapters import get_registry
 from .adapters.base import BaseAdapter
@@ -297,6 +299,40 @@ def _is_client_image_generation_tool(tool: object) -> bool:
             and ("imagegen" in name or "image_gen" in name)
         )
         for name in normalized
+    )
+
+
+def _prepare_native_chat_media(payload: dict, route) -> None:
+    """Chat clients need hosted image tools even after a compacted continuation."""
+    if not _route_supports_media_capability(route, "image_generation") or payload.get("tool_choice") == "none":
+        return
+    choice = payload.get("tool_choice")
+    selected_image_tool = (
+        isinstance(choice, dict) and _is_client_image_generation_tool(choice)
+    )
+    _replace_client_image_tools_with_hosted(payload, route)
+    tools = payload.setdefault("tools", [])
+    if not any(tool.get("type") == "image_generation" for tool in tools if isinstance(tool, dict)):
+        tools.append({"type": "image_generation"})
+    input_items = payload.get("input") or []
+    latest = _latest_user_text(input_items)
+    queries = re.findall(r"<user_query>([\s\S]*?)</user_query>", latest)
+    if queries:
+        latest = queries[-1]
+    explicit = (
+        bool(input_items) and input_items[-1].get("role") == "user"
+        and input_items[-1].get("type") == "message"
+        and not _is_meta_review_request(latest)
+        and not _looks_like_image_generation_suppression(latest)
+        and (_looks_like_image_generation_request(latest) or _looks_like_image_edit_request(latest))
+    )
+    if selected_image_tool or (explicit and choice in (None, "auto")):
+        payload["tool_choice"] = {"type": "image_generation"}
+    payload["instructions"] = str(payload.get("instructions") or "") + (
+        "\nThe selected custom model has a native image_generation tool. "
+        "For image generation or editing requests, including requests to use the current/custom model, "
+        "use this hosted tool directly. It does not use the client's separate ImageGen credit service. "
+        "Do not search for image plugins or ask for the current model's API configuration."
     )
 
 
@@ -3873,6 +3909,19 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     # ── 路由 ─────────────────────────────────────────────────────
 
+    @app.get("/generated-images/{filename}")
+    async def download_generated_image(filename: str):
+        # The random 128-bit filename is a bearer capability for this image only.
+        # Browser image tags cannot attach the client's API Authorization header.
+        path = generated_image_path(filename)
+        if path is None:
+            return JSONResponse({"error": "Image not found"}, status_code=404)
+        return FileResponse(path, headers={
+            "Cache-Control": "private, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        })
+
     @app.get("/health")
     async def health():
         reg = get_registry()
@@ -4274,10 +4323,14 @@ def create_app(verbose: bool = False) -> FastAPI:
                     if isinstance(trace_fields.get("tokens"), int):
                         provider_tokens = trace_fields["tokens"]
                     if event == "stream_finished":
-                        provider_finished = bool(trace_fields.get("completed"))
+                        provider_finished = bool(trace_fields.get("completed")) and not trace_fields.get("failed")
+                        cancelled = bool(trace_fields.get("cancelled"))
                         record_provider(
-                            200 if provider_finished else 499,
-                            "" if provider_finished else "Client disconnected before upstream Responses completion",
+                            200 if provider_finished else (499 if cancelled else 502),
+                            "" if provider_finished else (
+                                "Client disconnected before upstream Responses completion" if cancelled
+                                else str(trace_fields.get("error") or "Upstream Responses stream failed")
+                            ),
                         )
                     response_id = trace_fields.pop("response_id", "")
                     if response_id:
@@ -4971,6 +5024,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                     request_id=request_id,
                     access_key_id=principal.key_id,
                     on_trace=trace_native_chat,
+                    prepare_payload=lambda payload: _prepare_native_chat_media(payload, route),
+                    image_renderer=lambda item: render_generated_image(item, str(request.base_url)),
                 )
                 if not isinstance(response, StreamingResponse):
                     native_recorded = True
@@ -5897,11 +5952,28 @@ def _merge_stream_tool_call(buffers: dict[int, dict], delta: dict) -> None:
     item["function"]["arguments"] += str(function.get("arguments", ""))
 
 
+async def _close_chat_stream(chat_stream, pending_task: asyncio.Task | None = None) -> None:
+    """A heartbeat read belongs to its request, including while yielding SSE."""
+    with anyio.CancelScope(shield=True):
+        if pending_task is not None:
+            if not pending_task.done():
+                pending_task.cancel()
+            await asyncio.gather(pending_task, return_exceptions=True)
+        close = getattr(chat_stream, "aclose", None)
+        if callable(close):
+            await close()
+
+
 async def _next_stream_chunk(chat_stream, pending_task: asyncio.Task | None = None, timeout: float = 15.0):
     if pending_task is None:
         pending_task = asyncio.create_task(anext(chat_stream))
 
-    done, _ = await asyncio.wait({pending_task}, timeout=timeout)
+    try:
+        done, _ = await asyncio.wait({pending_task}, timeout=timeout)
+    except BaseException:
+        # The caller has not received the newly created task yet.
+        await _close_chat_stream(chat_stream, pending_task)
+        raise
     if not done:
         return None, True, pending_task
 
@@ -5949,6 +6021,7 @@ async def _handle_web_search_stream(
     first_response_ms: float | None = None
     pending_chunk_task = None
     pending_final_chunk_task = None
+    chat_stream = retry_stream = final_stream = None
     initial_recovery_attempts = 0
 
     try:
@@ -6601,9 +6674,6 @@ async def _handle_web_search_stream(
     except Exception as exc:
         stream_error = str(exc)
         logger.exception("web_search 流式处理异常")
-        for task in (pending_chunk_task, pending_final_chunk_task):
-            if task is not None and not task.done():
-                task.cancel()
         yield _response_sse_line({
             "type": "response.failed",
             "response": {
@@ -6629,6 +6699,11 @@ async def _handle_web_search_stream(
             first_response_ms=round(first_response_ms, 1) if first_response_ms is not None else None,
             error=stream_error,
         )
+    finally:
+        await _close_chat_stream(retry_stream or chat_stream, pending_chunk_task)
+        await _close_chat_stream(final_stream, pending_final_chunk_task)
+        if retry_stream is not None:
+            await _close_chat_stream(chat_stream)
 
 async def _buffered_responses_sse(response: dict):
     response_id = response["id"]
@@ -6886,8 +6961,8 @@ async def _handle_stream(
     except Exception as exc:
         stream_error = str(exc)
         logger.exception("流式处理异常")
-        if pending_chunk_task is not None and not pending_chunk_task.done():
-            pending_chunk_task.cancel()
+    finally:
+        await _close_chat_stream(chat_stream, pending_chunk_task)
 
     # 仅在流正常结束时发送 response.completed（异常时连接可能已断开）
     if not stream_error:
@@ -6934,26 +7009,41 @@ async def _handle_stream(
             translator = retry_translator
             chat_stream = client.chat_completion_stream(retry_req)
             pending_chunk_task = None
-            while True:
-                try:
-                    chunk, idle, pending_chunk_task = await _next_stream_chunk(chat_stream, pending_chunk_task)
-                except StopAsyncIteration:
-                    break
-                if idle:
-                    yield ": heartbeat\n\n"
-                    continue
-                chunk = adapter.stream_event_transform(chunk)
-                if verbose:
-                    _safe_log("Chat reasoning retry chunk", chunk)
-                for event_line in translator.translate_chunk(chunk):
-                    yield event_line
-        try:
+            try:
+                while True:
+                    try:
+                        chunk, idle, pending_chunk_task = await _next_stream_chunk(chat_stream, pending_chunk_task)
+                    except StopAsyncIteration:
+                        break
+                    if idle:
+                        yield ": heartbeat\n\n"
+                        continue
+                    chunk = adapter.stream_event_transform(chunk)
+                    if verbose:
+                        _safe_log("Chat reasoning retry chunk", chunk)
+                    for event_line in translator.translate_chunk(chunk):
+                        yield event_line
+            except Exception as exc:
+                stream_error = str(exc) or type(exc).__name__
+                logger.exception("推理重试流式处理异常")
+            finally:
+                await _close_chat_stream(chat_stream, pending_chunk_task)
+        if not stream_error:
             for event_line in translator._finish():
                 yield event_line
-        except Exception:
-            pass  # 客户端已断开连接
 
     if stream_error:
+        yield _response_sse_line({
+            "type": "response.failed",
+            "response": {
+                "id": translator.response_id,
+                "object": "response",
+                "model": model,
+                "status": "failed",
+                "output": [],
+                "error": {"message": stream_error, "type": "stream_error"},
+            },
+        })
         _record_request(
             start_time, model, "responses", 500, True, stream_error,
             provider=provider, target_model=target_model,

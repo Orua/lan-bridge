@@ -140,9 +140,16 @@ class Config:
         else:
             loaded = {}
         with self._lock:
-            self._config_path = path
-            self._data = loaded
-            self._inject_env()
+            previous_data, previous_path = self._data, self._config_path
+            try:
+                self._config_path = path
+                self._data = loaded
+                self._inject_env()
+            except BaseException:
+                # Valid YAML can still contain invalid provider/server shapes.
+                # Normalization must succeed before the new state is committed.
+                self._data, self._config_path = previous_data, previous_path
+                raise
             self._file_signature = self._stat_signature(path)
             self._reload_attempt_signature = self._file_signature
 

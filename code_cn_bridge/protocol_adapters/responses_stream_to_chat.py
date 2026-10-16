@@ -6,7 +6,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 
@@ -82,7 +82,7 @@ async def _events(chunks: AsyncIterator[bytes | str]) -> AsyncIterator[dict[str,
 class ResponsesStreamToChat:
     """Stateful converter with stable tool indexes and no duplicate deltas."""
 
-    def __init__(self, model: str, request_id: str):
+    def __init__(self, model: str, request_id: str, *, image_renderer: Callable[[dict], str] | None = None):
         self.model = model
         self.request_id = request_id
         self.chunk_id = f"chatcmpl-bridge-{uuid.uuid4().hex}"
@@ -96,6 +96,18 @@ class ResponsesStreamToChat:
         self.tool_calls: dict[str, dict[str, Any]] = {}
         self._next_tool_index = 0
         self.usage: dict[str, int] | None = None
+        self.image_renderer = image_renderer
+        self.image_keys: set[str] = set()
+
+    def _image_chunks(self, item: dict, output_index: Any = None) -> list[str]:
+        key = str(item.get("id") or output_index or "image")
+        if key in self.image_keys:
+            return []
+        if self.image_renderer is None:
+            raise ValueError("图片结果缺少可用的交付处理器")
+        text = self.image_renderer(item)
+        self.image_keys.add(key)
+        return [_chunk(self.chunk_id, self.model, {"content": text})]
 
     def _start(self) -> list[str]:
         if self.started:
@@ -214,7 +226,13 @@ class ResponsesStreamToChat:
                     }))
             elif event_type == "response.output_item.done":
                 item = event.get("item")
-                if isinstance(item, dict) and item.get("type") == "function_call":
+                if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                    try:
+                        emitted.extend(self._image_chunks(item, event.get("output_index")))
+                    except (ValueError, OSError):
+                        self.failed = self.terminal = True
+                        emitted.extend([_error("图片生成结果保存失败", self.request_id), "data: [DONE]\n\n"])
+                elif isinstance(item, dict) and item.get("type") == "function_call":
                     key, state = self._tool_state(event, item)
                     delta = self._append_argument(state, item.get("arguments", ""))
                     if delta:
@@ -232,6 +250,15 @@ class ResponsesStreamToChat:
                         emitted.append(_chunk(self.chunk_id, self.model, {"content": value}))
             elif event_type in {"response.completed", "response.incomplete"}:
                 response = event.get("response") if isinstance(event.get("response"), dict) else {}
+                try:
+                    for index, item in enumerate(response.get("output") or []):
+                        if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                            emitted.extend(self._image_chunks(item, index))
+                except (ValueError, OSError):
+                    self.failed = self.terminal = True
+                    for value in emitted + [_error("图片生成结果保存失败", self.request_id), "data: [DONE]\n\n"]:
+                        yield value
+                    return
                 self.usage = _usage(response.get("usage"))
                 emitted.append(_chunk(
                     self.chunk_id,
@@ -252,6 +279,8 @@ class ResponsesStreamToChat:
 
             for value in emitted:
                 yield value
+            if self.terminal:
+                return
 
         if not self.terminal:
             # A compliant Responses stream ends with response.completed or

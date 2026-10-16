@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.14 — 2026-10-16
+
+- Keep the last valid configuration when hot-reload normalization fails, including syntactically valid YAML with invalid provider/server structures.
+- Close upstream clients on cancellation, request preparation errors, and failed error-body reads. Shield cleanup during stream cancellation and cancel pending heartbeat reads when a client disconnects.
+- Observe custom-provider Responses streams with the shared SSE parser, preserving bytes and recognizing multiline or unterminated final events. Distinguish upstream failure/truncation (502) from client cancellation (499).
+- Honor manual stop and application quit during asynchronous startup probes. Make the watchdog respect scheduled restart backoff instead of restarting early.
+- Include startup-race and existing Codex configuration preservation tests in the desktop release checks.
+- Validation: 363 Python tests and 10 subtests; desktop typecheck/build and 18 tests; packaged backend hash/CSP/version checks; deployed native Chat and custom Responses streaming requests passed.
+
+## 0.2.13 — 2026-10-14
+
+- Expose native hosted image generation/editing to Chat Completions clients, including WorkBuddy custom models and compacted continuations. Respect explicit tool opt-out and preserve image inputs.
+- Translate completed image results into preview/download links for streaming and JSON replies; persist each final image once and report delivery failures instead of empty success.
+- Serve generated PNG/JPEG/WebP files through random, image-only download URLs. Anyone with a download URL can view that image; API credentials are never embedded in links. Store images on G: when available, or use `LAN_BRIDGE_IMAGE_OUTPUT_DIR`.
+- Validation: 341 Python tests and 10 subtests, desktop typecheck/build and 11 Electron tests; a real native `gpt-6.1-sol` Chat request generated an apple PNG and its download returned the saved bytes.
+
 ## 0.2.12 — 2026-10-10
 
 - Discover the live ChatGPT account catalog using the host Codex version, so older downstream clients no longer hide new models such as `gpt-6.1-sol`.
