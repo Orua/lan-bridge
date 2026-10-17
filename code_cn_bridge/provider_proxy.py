@@ -14,7 +14,7 @@ from fastapi.responses import Response, StreamingResponse
 
 from .adapters.base import BaseAdapter
 from .http_utils import make_provider_async_client as make_async_client
-from .http_utils import close_http_client
+from .http_utils import close_http_client, send_with_connect_retries
 from .sse_observer import SSEJsonObserver
 from .native_proxy import (
     _native_context_put,
@@ -235,7 +235,7 @@ async def proxy_provider_responses(
             headers=_provider_headers(adapter, api_key),
             content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         )
-        upstream = await client.send(request, stream=True)
+        upstream = await send_with_connect_retries(client, request, stream=True)
     except BaseException:
         await close_http_client(client)
         raise
@@ -413,7 +413,7 @@ async def proxy_chat_to_responses(
             headers=_provider_headers(adapter, api_key),
             content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         )
-        upstream = await client.send(request, stream=True)
+        upstream = await send_with_connect_retries(client, request, stream=True)
     except BaseException:
         await close_http_client(client)
         raise

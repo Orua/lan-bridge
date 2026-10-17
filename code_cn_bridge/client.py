@@ -11,6 +11,7 @@ import httpx
 
 from .adapters.base import BaseAdapter
 from .http_utils import make_provider_async_client as make_async_client
+from .http_utils import send_with_connect_retries, stream_with_connect_retries
 
 
 logger = logging.getLogger("lan-bridge.client")
@@ -119,7 +120,8 @@ class UpstreamClient:
         client = await self._get_client()
         headers = self.adapter.get_headers(self.api_key)
 
-        response = await client.post(self._chat_url, json=chat_req, headers=headers)
+        request = client.build_request("POST", self._chat_url, json=chat_req, headers=headers)
+        response = await send_with_connect_retries(client, request)
         if response.status_code >= 400:
             body = await response.aread()
             raise httpx.HTTPStatusError(
@@ -135,7 +137,8 @@ class UpstreamClient:
         headers = self.adapter.get_headers(self.api_key)
         chat_req["stream"] = True
 
-        async with client.stream("POST", self._chat_url, json=chat_req, headers=headers) as response:
+        request = client.build_request("POST", self._chat_url, json=chat_req, headers=headers)
+        async with stream_with_connect_retries(client, request) as response:
             if response.status_code >= 400:
                 body = await response.aread()
                 raise httpx.HTTPStatusError(

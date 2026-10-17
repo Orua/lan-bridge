@@ -18,6 +18,8 @@ extraResources:
     to: backend/
   - from: assets/
     to: assets/
+  - from: recovery/
+    to: recovery/
 
 mac:
   target:

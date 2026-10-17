@@ -20,7 +20,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
-from .http_utils import close_http_client, make_native_async_client
+from .http_utils import close_http_client, make_native_async_client, send_with_connect_retries
 from .sse_observer import SSEJsonObserver
 from .codex_auth import (
     NativeAuthError,
@@ -634,7 +634,7 @@ async def proxy_native_responses(
 
     try:
         upstream_request = build_upstream_request()
-        upstream = await client.send(upstream_request, stream=True)
+        upstream = await send_with_connect_retries(client, upstream_request, stream=True)
     except BaseException:
         await close_http_client(client)
         raise

@@ -12,6 +12,7 @@ import {
   shouldRestartBridge,
 } from './bridgeLifecycle';
 import { restoreOfficialConfigPreservingUserSettings } from './codexConfig';
+import { installRecoveryTask, writeRecoveryState } from './recovery';
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -193,6 +194,28 @@ function cancelBridgeRestart() {
     clearTimeout(bridgeRestartTimer);
     bridgeRestartTimer = null;
   }
+}
+
+function persistRecoveryState(enabled = true): boolean {
+  if (isDev || process.platform !== 'win32' || !gotTheLock) return false;
+  try {
+    writeRecoveryState(recoveryStateFile(), {
+      enabled,
+      desiredRunning: bridgeDesiredRunning,
+      desktopPid: process.pid,
+      desktopExecutable: process.execPath,
+      version: app.getVersion(),
+    });
+    return true;
+  } catch (error) {
+    writeDesktopLog('ERROR', '无法保存独立守护状态', error);
+    return false;
+  }
+}
+
+function recoveryStateFile(): string {
+  const localData = process.env.LOCALAPPDATA || path.join(app.getPath('appData'), '..', 'Local');
+  return path.join(localData, 'lan-bridge', 'recovery', 'state.json');
 }
 
 function cancelBridgeStableTimer() {
@@ -378,6 +401,7 @@ async function startBridgeProcess() {
 
 function stopBridgeProcess(stopBorrowedBridge = false) {
   bridgeDesiredRunning = false;
+  persistRecoveryState(!isQuitting);
   cancelBridgeRestart();
   cancelBridgeStableTimer();
   const processToStop = bridgeProcess;
@@ -430,7 +454,7 @@ function createWindow() {
 
   // 窗口准备好后显示
   mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
+    if (!process.argv.includes('--bridge-recovery')) mainWindow?.show();
   });
 
   // 关闭窗口 → 根据设置决定隐藏到托盘或退出
@@ -486,6 +510,7 @@ function createTray() {
       label: '启动代理',
       click: () => {
         bridgeDesiredRunning = true;
+        persistRecoveryState();
         bridgeRestartCount = 0;
         void startBridgeProcess();
       },
@@ -699,12 +724,17 @@ app.whenReady().then(() => {
   createTray();
   createWindow();
   startBridgeWatchdog();
-  if (getAutoStartSetting()) {
+  if (getAutoStartSetting() || process.argv.includes('--bridge-recovery')) {
     bridgeDesiredRunning = true;
     void startBridgeProcess();
   } else {
     bridgeDesiredRunning = false;
     console.log('[Main] auto_start disabled, bridge not started automatically');
+  }
+  if (persistRecoveryState()) {
+    void installRecoveryTask(path.join(process.resourcesPath, 'recovery', 'BridgeRecovery.ps1'), recoveryStateFile())
+      .then(() => writeDesktopLog('INFO', '独立自动恢复守护已启用'))
+      .catch(error => writeDesktopLog('ERROR', '独立自动恢复守护安装失败', error));
   }
 }).catch((error) => {
   writeDesktopLog('FATAL', 'Electron 初始化失败；主进程保持存活以便诊断', error);

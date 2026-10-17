@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.15 — 2026-10-17
+
+- Add an independent Windows Task Scheduler watcher that checks the desktop PID every five seconds and recovers unexpected whole-app exits. Manual stop/quit persists recovery intent; recovery launches stay in the tray and respect the existing login-start preference.
+- Retry upstream connection setup failures at most twice with 0.5s/1s backoff for native Responses, custom Responses, and Chat routes. Never retry HTTP errors, read/write failures, or an already-started stream; cancellation stops retries immediately.
+- Validate recovery state atomically, verify executable identity, and throttle repeated desktop starts. Keep recovery state and rotated diagnostic logs under the user's local application data.
+- Validation: 379 Python tests and 10 subtests; desktop typecheck/build and 20 tests. After all seven deployed desktop/backend processes were force-terminated, the independent watcher restored a healthy 0.2.15 instance in 5.64 seconds. Native Chat and custom Responses streaming requests then passed.
+
 ## 0.2.14 — 2026-10-16
 
 - Keep the last valid configuration when hot-reload normalization fails, including syntactically valid YAML with invalid provider/server structures.

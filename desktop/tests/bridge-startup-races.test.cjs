@@ -19,6 +19,7 @@ function harness(probes = {}) {
     STABLE_RUN_RESET_MS: 30000, STARTUP_HEALTH_TIMEOUT_MS: 30000,
     process, console: { log() {}, error() {} },
     writeDesktopLog() {}, safeSend() {},
+    isDev: true,
     bridgeIsHealthy: probes.health || (async () => false),
     bridgePortIsOpen: probes.port || (async () => false),
     waitForBridgeHealthy: async () => true,

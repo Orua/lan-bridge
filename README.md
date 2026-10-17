@@ -355,6 +355,27 @@ it to the client environment immediately. The bridge records a small local
 summary of request count and input/output/total tokens per key; it does not
 store prompts or upstream login tokens in that summary.
 
+## Windows recovery and upstream connection retries
+
+Packaged Windows builds install a per-user `LAN BRIDGE Recovery-<SID>` scheduled
+task on launch. Task Scheduler runs the watcher outside the desktop process
+tree, checking every five seconds and recovering unexpected whole-app exits.
+The desktop still supervises its backend. Recovery launches stay in the tray.
+Choosing **Stop** or **Quit** pauses recovery; starting the app/proxy enables it
+again. The task has no login trigger, so the existing launch-at-login preference
+continues to control startup after a new login.
+
+Recovery state and rotated logs are stored under
+`%LOCALAPPDATA%\lan-bridge\recovery\`. The watcher validates the desktop
+executable path, avoids duplicate starts, and allows 30 seconds for a replacement
+desktop to start. Task Scheduler restarts a failed watcher after one minute.
+
+Upstream connection setup failures (`ConnectTimeout`/`ConnectError`) are retried
+at most twice, after 0.5s and 1s. Read/write failures, HTTP error responses, and
+streams that have already started are never replayed. A cancellation interrupts
+the retry wait immediately. A persistent native connection outage can therefore
+take about 46.5 seconds to exhaust its three 15-second connection attempts.
+
 ## Tests
 
 ```powershell

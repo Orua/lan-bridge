@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import logging
 import ssl
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
 import anyio
+
+
+logger = logging.getLogger("lan-bridge.http")
+
+
+async def send_with_connect_retries(
+    client: httpx.AsyncClient, request: httpx.Request, *, stream: bool = False,
+) -> httpx.Response:
+    """Retry connection setup only; never replay a request after writes/reads."""
+    for attempt in range(3):
+        try:
+            return await client.send(request, stream=stream)
+        except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+            if attempt == 2:
+                raise
+            delay = 0.5 * (2 ** attempt)
+            logger.warning(
+                "Upstream connection retry=%d/2 delay=%.1fs host=%s error=%s",
+                attempt + 1, delay, request.url.host, type(exc).__name__,
+            )
+            await anyio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+@asynccontextmanager
+async def stream_with_connect_retries(client: httpx.AsyncClient, request: httpx.Request):
+    response = await send_with_connect_retries(client, request, stream=True)
+    try:
+        yield response
+    finally:
+        with anyio.CancelScope(shield=True):
+            await response.aclose()
 
 
 async def close_http_client(client: httpx.AsyncClient, response: httpx.Response | None = None) -> None:
