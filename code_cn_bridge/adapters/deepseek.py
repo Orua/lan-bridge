@@ -31,18 +31,17 @@ class DeepSeekAdapter(BaseAdapter):
             if wb_effort and wb_effort != "none":
                 effort = wb_effort
 
-        # Low explicitly disables thinking. Medium leaves DeepSeek at its own
-        # default. Higher settings explicitly enable thinking.
+        # Current DeepSeek accepts low/high/max. Normalize Codex effort names
+        # explicitly so the configured strength survives either inbound API.
         if "thinking" not in chat_req:
-            if effort in {"none", "off", "disabled", "minimal", "low"}:
+            if effort in {"none", "off", "disabled"}:
                 chat_req["thinking"] = {"type": "disabled"}
                 chat_req.pop("reasoning_effort", None)
-            elif effort in {"high", "xhigh", "max"}:
+            elif effort in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
                 chat_req["thinking"] = {"type": "enabled"}
-                if effort in {"xhigh", "max"}:
-                    chat_req["reasoning_effort"] = "max"
-                elif effort == "high":
-                    chat_req["reasoning_effort"] = "high"
+                chat_req["reasoning_effort"] = (
+                    "max" if effort in {"max", "ultra"} else "low" if effort in {"minimal", "low"} else "high"
+                )
 
         # DeepSeek rejects forced tool selection while thinking mode is active.
         # A forced choice is more specific than the reasoning preference, so

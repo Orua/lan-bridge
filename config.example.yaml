@@ -39,6 +39,17 @@ providers:
     api_key_env: OPENAI_API_KEY
 
 model_mapping:
+  deepseek-flash:
+    target: deepseek-flash
+    provider: deepseek
+    inbound_protocol: responses
+    upstream_protocol: chat
+    wire_api: chat
+    is_multimodal: true
+    is_reasoning_text: true
+    capabilities:
+      vision: true
+      reasoning: true
   gpt-5-code:
     target: qwen-plus
     provider: qwen

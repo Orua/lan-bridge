@@ -234,10 +234,10 @@ class ProtocolToolTests(unittest.TestCase):
 
     def test_deepseek_reasoning_effort_maps_to_thinking_policy(self):
         cases = [
-            ("low", {"type": "disabled"}, None),
-            ("medium", None, None),
+            ("low", {"type": "enabled"}, "low"),
+            ("medium", {"type": "enabled"}, "high"),
             ("high", {"type": "enabled"}, "high"),
-            ("xhigh", {"type": "enabled"}, "max"),
+            ("xhigh", {"type": "enabled"}, "high"),
             ("max", {"type": "enabled"}, "max"),
             ("none", {"type": "disabled"}, None),
         ]

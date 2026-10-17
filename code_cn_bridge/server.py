@@ -3542,8 +3542,13 @@ def _route_vision(model: str, body: dict, request_id: str = "") -> tuple[BaseAda
         logger.info("检测到当前轮图片，剥离更早历史图片以避免视觉模型上下文超限")
         _strip_historical_images_before_current_turn(input_items)
 
-    # A configured vision slot is the active visual capability, regardless of
-    # the text alias Codex used for the request.
+    # Native multimodal models must keep the selected model, including when a
+    # separate global vision slot was configured for older text-only models.
+    selected_entry = cfg.model_mapping.get(model)
+    if isinstance(selected_entry, dict) and selected_entry.get("enabled", True) and selected_entry.get("is_multimodal"):
+        return _get_adapter_for_model(model)
+
+    # The vision slot remains a fallback for text-only and legacy aliases.
     vision_slot = getattr(cfg, "model_slots", {}).get("vision", {})
     if isinstance(vision_slot, dict) and vision_slot.get("enabled", True):
         vision_target = str(vision_slot.get("target", "")).strip()

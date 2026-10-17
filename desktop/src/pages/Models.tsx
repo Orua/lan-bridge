@@ -234,9 +234,10 @@ const Models: React.FC = () => {
         </div>
         <div className="catalog-note">{tl(['入站协议和上游协议必须显式配置；WorkBuddy 适配请选择“Chat Completions → Responses”。代理按模型独立生效；关闭时强制直连。', 'Inbound and upstream protocols are explicit; choose “Chat Completions → Responses” for WorkBuddy. Proxy settings apply per model and are direct when disabled.'])}</div>
         <div className="capability-picker">
-          {([['is_reasoning_text', 'Reasoning'], ['is_multimodal', 'Vision'], ['is_image_gen', 'Image generation'], ['is_video_gen', 'Video generation']] as const).map(([key, label]) =>
+          {([['is_reasoning_text', 'Reasoning'], ['is_multimodal', tl(['多模态（图片输入）', 'Multimodal (image input)'])], ['is_image_gen', 'Image generation'], ['is_video_gen', 'Video generation']] as const).map(([key, label]) =>
             <label key={key}><input type="checkbox" checked={form[key]} onChange={e => setForm({ ...form, [key]: e.target.checked })} />{label}</label>)}
         </div>
+        <p className="catalog-note">{tl(['支持图片输入的模型（如 deepseek-flash）勾选多模态后直接识图，无需另选识图模型。', 'Enable multimodal for image-capable models such as deepseek-flash to process images directly.'])}</p>
         <div className="slot-actions">
           <button className="btn btn-primary" onClick={save} disabled={busy === 'save'}>{busy === 'save' ? tl(['保存中...', 'Saving...']) : tl(['保存模型', 'Save model'])}</button>
           <button className="btn" onClick={() => test(form.alias || '__new__', payload())} disabled={Boolean(busy)}>{tl(['测试连接', 'Test connection'])}</button>
