@@ -1018,7 +1018,7 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
 
 
 async def fetch_merged_models(request: Request, config) -> Response:
-    client = _native_client(config, httpx.Timeout(10.0, connect=5.0))
+    client = _native_client(config, httpx.Timeout(5.0, connect=2.0))
     url = f"{_native_base_url(config)}/models"
     host_version = await asyncio.to_thread(_host_catalog_client_version, config)
     requested_version = request.query_params.get("client_version", "")
@@ -1026,13 +1026,23 @@ async def fetch_merged_models(request: Request, config) -> Response:
     query = [(name, value) for name, value in request.query_params.multi_items() if name not in {"client_version", "refresh"}]
     query.append(("client_version", catalog_version))
     try:
-        upstream = await client.get(
-            url,
-            params=query,
-            headers=native_request_headers(request.headers, config),
-        )
+        cache_key = (url, tuple(query))
+        cached = getattr(config, "_native_catalog_cache", None)
+        cached = cached if cached and cached[0] == cache_key else None
+        cached_age = time.monotonic() - cached[1] if cached else float("inf")
+        from_cache = bool(cached and cached_age < 60 and request.query_params.get("refresh") != "1")
+        if from_cache:
+            upstream = httpx.Response(200, json=cached[2])
+        else:
+            try:
+                upstream = await client.get(url, params=query, headers=native_request_headers(request.headers, config))
+            except (httpx.HTTPError, NativeAuthError):
+                from_cache = bool(cached and cached_age < 300)
+                upstream = httpx.Response(200, json=cached[2]) if from_cache else httpx.Response(503)
         if upstream.is_success:
             native_payload = upstream.json()
+            if not from_cache:
+                config._native_catalog_cache = (cache_key, time.monotonic(), native_payload)
             merged = merge_model_catalog(native_payload, config)
             merged["native_catalog"] = {"source": "account", "client_version": catalog_version, "available": True}
             headers = _response_headers(upstream.headers)
