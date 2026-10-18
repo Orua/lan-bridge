@@ -3327,8 +3327,9 @@ def _default_text_model_alias(cfg) -> str | None:
 _LOW_REASONING_EFFORTS = {"none", "off", "disabled", "minimal", "low"}
 _REASONING_ONLY_RETRY_MESSAGE = (
     "The previous upstream attempt returned only reasoning/thinking and no "
-    "final answer or tool call. Retry with thinking disabled. Return a final "
-    "assistant answer or a valid tool_call; do not return reasoning-only output."
+    "final answer or tool call. Continue using the requested thinking configuration, "
+    "and provide a final assistant answer or a valid tool_call; do not return "
+    "reasoning-only output."
 )
 _REASONING_ONLY_RETRY_MIN_TOKENS = 512
 
@@ -3364,9 +3365,6 @@ def _is_reasoning_only_output(output_items: list[dict], start_index: int = 0) ->
 
 def _build_reasoning_only_retry_request(chat_req: dict) -> dict:
     retry = copy.deepcopy(chat_req)
-    retry["thinking"] = {"type": "disabled"}
-    retry.pop("reasoning_effort", None)
-    retry.pop("_codex_reasoning_effort", None)
 
     max_tokens = retry.get("max_tokens")
     if isinstance(max_tokens, int) and max_tokens < _REASONING_ONLY_RETRY_MIN_TOKENS:
@@ -3387,8 +3385,11 @@ def _audit_reasoning_only_retry(request_id: str, phase: str, attempt: int, chat_
         request_id,
         phase=phase,
         attempt=attempt,
+        reason="reasoning_without_action",
+        model=chat_req.get("model"),
         max_tokens=chat_req.get("max_tokens"),
         thinking=chat_req.get("thinking"),
+        reasoning_effort=chat_req.get("reasoning_effort") or chat_req.get("_codex_reasoning_effort"),
     )
 
 
@@ -5944,8 +5945,13 @@ def _citation_annotations(text: str, sources: list[dict]) -> list[dict]:
 
 
 def _merge_stream_tool_call(buffers: dict[int, dict], delta: dict) -> None:
+    max_tool_calls = 128
+    max_arguments_bytes = 4 * 1024 * 1024
+    max_total_arguments_bytes = 16 * 1024 * 1024
     index = int(delta.get("index", 0))
     function = delta.get("function", {})
+    if index not in buffers and len(buffers) >= max_tool_calls:
+        raise ValueError(f"Stream exceeds {max_tool_calls} tool calls")
     item = buffers.setdefault(index, {
         "id": "",
         "type": "function",
@@ -5953,8 +5959,21 @@ def _merge_stream_tool_call(buffers: dict[int, dict], delta: dict) -> None:
     })
     if delta.get("id"):
         item["id"] = delta["id"]
-    item["function"]["name"] += str(function.get("name", ""))
-    item["function"]["arguments"] += str(function.get("arguments", ""))
+    name_delta = str(function.get("name", ""))
+    argument_delta = str(function.get("arguments", ""))
+    if len((item["function"]["name"] + name_delta).encode("utf-8", errors="replace")) > 512:
+        raise ValueError("Stream tool name exceeds 512 byte limit")
+    arg_bytes = len((item["function"]["arguments"] + argument_delta).encode("utf-8", errors="replace"))
+    total_bytes = sum(
+        len(call["function"]["arguments"].encode("utf-8", errors="replace"))
+        for call in buffers.values()
+    ) + len(argument_delta.encode("utf-8", errors="replace"))
+    if arg_bytes > max_arguments_bytes:
+        raise ValueError(f"Stream tool arguments exceed {max_arguments_bytes} byte limit")
+    if total_bytes > max_total_arguments_bytes:
+        raise ValueError(f"Stream tool argument buffers exceed {max_total_arguments_bytes} byte limit")
+    item["function"]["name"] += name_delta
+    item["function"]["arguments"] += argument_delta
 
 
 async def _close_chat_stream(chat_stream, pending_task: asyncio.Task | None = None) -> None:
@@ -6594,11 +6613,6 @@ async def _handle_web_search_stream(
             )
             prefix_count = len(prefix_items)
             for chunk in followup_chunks:
-                choices = chunk.get("choices", [])
-                finish_reason = choices[0].get("finish_reason") if choices else None
-                if finish_reason:
-                    chunk = copy.deepcopy(chunk)
-                    chunk["choices"][0]["finish_reason"] = None
                 for event_line in final_translator.translate_chunk(chunk):
                     yield event_line
             _attach_source_citations(final_translator._output_items, sources)

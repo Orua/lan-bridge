@@ -660,7 +660,7 @@ class WebSearchFlowTests(unittest.IsolatedAsyncioTestCase):
         deltas = [payload["delta"] for payload in payloads if payload["type"] == "response.output_text.delta"]
 
         self.assertEqual(len(client.requests), 3)
-        self.assertEqual(client.requests[2]["thinking"], {"type": "disabled"})
+        self.assertNotIn("thinking", client.requests[2])
         self.assertEqual(deltas, ["final after reasoning retry"])
         self.assertFalse(any(payload["type"] == "response.failed" for payload in payloads))
 
@@ -692,11 +692,11 @@ class WebSearchFlowTests(unittest.IsolatedAsyncioTestCase):
         failed = next(payload for payload in payloads if payload["type"] == "response.failed")
 
         self.assertEqual(len(client.requests), 3)
-        self.assertEqual(client.requests[2]["thinking"], {"type": "disabled"})
+        self.assertNotIn("thinking", client.requests[2])
         self.assertEqual(failed["response"]["error"]["type"], "reasoning_without_action")
         self.assertFalse(any(payload["type"] == "response.completed" for payload in payloads))
 
-    async def test_plain_stream_retries_reasoning_only_with_thinking_disabled(self):
+    async def test_plain_stream_retries_reasoning_only_without_changing_thinking(self):
         request = {
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": "Only answer OK."}],
@@ -718,7 +718,7 @@ class WebSearchFlowTests(unittest.IsolatedAsyncioTestCase):
         deltas = [payload["delta"] for payload in payloads if payload["type"] == "response.output_text.delta"]
 
         self.assertEqual(len(client.requests), 2)
-        self.assertEqual(client.requests[1]["thinking"], {"type": "disabled"})
+        self.assertNotIn("thinking", client.requests[1])
         self.assertEqual(client.requests[1]["max_tokens"], 512)
         self.assertEqual(deltas, ["OK"])
         self.assertTrue(any(payload["type"] == "response.completed" for payload in payloads))

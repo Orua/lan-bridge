@@ -295,6 +295,44 @@ class ProtocolToolTests(unittest.TestCase):
         self.assertEqual([message["reasoning_content"] for message in assistants], ["", "original reasoning", "Read exactly once."])
         self.assertEqual(request["thinking"], {"type": "enabled"})
 
+    def test_multiple_reasoning_items_are_merged_in_input_order(self):
+        request = translate_request({"input": [
+            {"role": "user", "content": "continue"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "first"}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "second"}]},
+            {"role": "assistant", "content": "answer"},
+        ]}, self.adapter, "deepseek-chat")
+
+        assistant = next(message for message in request["messages"] if message["role"] == "assistant")
+        self.assertEqual(assistant["reasoning_content"], "first\nsecond")
+
+    def test_orphan_tool_output_keeps_tool_role_and_provenance(self):
+        request = translate_request({"input": [
+            {"role": "user", "content": "continue"},
+            {"type": "function_call_output", "call_id": "call_orphan", "output": "write completed"},
+        ]}, self.adapter, "deepseek-chat")
+
+        messages = request["messages"]
+        call = next(message for message in messages if message.get("tool_calls"))
+        result = next(message for message in messages if message["role"] == "tool")
+        self.assertEqual(call["tool_calls"][0]["id"], "call_orphan")
+        self.assertEqual(call["tool_calls"][0]["function"]["name"], "prior_tool_call_unavailable")
+        self.assertEqual(result["tool_call_id"], "call_orphan")
+        self.assertEqual(result["content"], "write completed")
+
+    def test_tool_call_without_saved_result_keeps_action_and_unknown_status(self):
+        request = translate_request({"input": [
+            {"role": "user", "content": "continue"},
+            {"type": "function_call", "call_id": "call_maybe_written", "name": "write_file", "arguments": '{"path":"a.txt"}'},
+        ]}, self.adapter, "deepseek-chat")
+
+        assistant = next(message for message in request["messages"] if message.get("tool_calls"))
+        result = next(message for message in request["messages"] if message["role"] == "tool")
+        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "write_file")
+        self.assertEqual(assistant["tool_calls"][0]["function"]["arguments"], '{"path":"a.txt"}')
+        self.assertEqual(result["tool_call_id"], "call_maybe_written")
+        self.assertIn("Execution status unknown", result["content"])
+
     def test_named_deepseek_provider_applies_compat_to_generic_adapter(self):
         request = {
             "model": "deepseek-v4-pro",
@@ -2021,6 +2059,31 @@ class ProtocolToolTests(unittest.TestCase):
         self.assertEqual(reasoning_delta["delta"], "thinking only")
         self.assertEqual(failed["response"]["error"]["type"], "reasoning_without_action")
         self.assertFalse(any(p["type"] == "response.completed" for p in payloads))
+
+    def test_stream_eof_and_length_are_incomplete(self):
+        for finish_reason in (None, "length"):
+            translator = StreamTranslator(response_id="resp_truncated", model="gpt-5")
+            chunk = {"choices": [{"delta": {"content": "partial"}, "finish_reason": finish_reason}]}
+            events = translator.translate_chunk(chunk)
+            events.extend(translator._finish())
+            payloads = [json.loads(line.removeprefix("data: ").strip()) for line in events]
+            self.assertFalse(any(item["type"] == "response.completed" for item in payloads))
+            failed = next(item for item in payloads if item["type"] == "response.failed")
+            self.assertEqual(failed["response"]["status"], "incomplete")
+
+    def test_stream_rejects_incomplete_json_tool_arguments_before_done(self):
+        translator = StreamTranslator(response_id="resp_bad_tool_json", model="gpt-5")
+        events = translator.translate_chunk({"choices": [{
+            "delta": {"tool_calls": [{
+                "index": 0, "id": "call_bad_json",
+                "function": {"name": "write_file", "arguments": '{"path":"x"'},
+            }]},
+            "finish_reason": "tool_calls",
+        }]})
+        payloads = [json.loads(line.removeprefix("data: ").strip()) for line in events]
+        self.assertTrue(any(item["type"] == "response.failed" for item in payloads))
+        self.assertFalse(any(item["type"] == "response.function_call_arguments.done" for item in payloads))
+        self.assertFalse(any(item["type"] == "response.completed" for item in payloads))
 
 
 class VisionRoutingTests(unittest.TestCase):

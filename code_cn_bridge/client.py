@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 import hashlib
 import json
 import logging
+from collections import OrderedDict
 from typing import AsyncIterator
 
 import httpx
@@ -15,30 +18,71 @@ from .http_utils import send_with_connect_retries, stream_with_connect_retries
 
 
 logger = logging.getLogger("lan-bridge.client")
+_SSE_LINE_MAX_BYTES = 8 * 1024 * 1024
+_SSE_EVENT_MAX_BYTES = 8 * 1024 * 1024
+_UPSTREAM_CLIENT_POOL_MAX_ENTRIES = 16
+
+
+async def _iter_bounded_sse_lines(response: httpx.Response) -> AsyncIterator[str]:
+    # Bound an unfinished line before HTTPX's unbounded text-line accumulator.
+    if not hasattr(response, "aiter_bytes"):
+        async for line in response.aiter_lines():
+            yield line
+        return
+    pending = bytearray()
+    skip_lf = False
+    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+        for part in re.split(br"([\r\n])", chunk):
+            if part in (b"\r", b"\n"):
+                if part == b"\n" and skip_lf:
+                    skip_lf = False
+                    continue
+                yield pending.decode("utf-8", errors="replace")
+                pending.clear()
+                skip_lf = part == b"\r"
+            elif part:
+                skip_lf = False
+                if len(pending) + len(part) > _SSE_LINE_MAX_BYTES:
+                    raise ValueError(f"Upstream SSE line exceeds {_SSE_LINE_MAX_BYTES} byte limit")
+                pending.extend(part)
+    if pending:
+        yield pending.decode("utf-8", errors="replace")
 
 
 async def _iter_sse_data(response: httpx.Response) -> AsyncIterator[str]:
     """Yield complete SSE data payloads, including recoverable multiline JSON."""
     data_lines: list[str] = []
+    event_bytes = 0
 
-    async for line in response.aiter_lines():
+    async for line in _iter_bounded_sse_lines(response):
+        line_bytes = len(line.encode("utf-8", errors="replace"))
+        if line_bytes > _SSE_LINE_MAX_BYTES:
+            raise ValueError(f"Upstream SSE line exceeds {_SSE_LINE_MAX_BYTES} byte limit")
         if not line:
             if data_lines:
                 yield "\n".join(data_lines)
                 data_lines.clear()
+            event_bytes = 0
             continue
         if line.startswith(":"):
             continue
 
         field, separator, value = line.partition(":")
         if field == "data" and separator:
-            data_lines.append(value[1:] if value.startswith(" ") else value)
+            value = value[1:] if value.startswith(" ") else value
+            event_bytes += line_bytes
+            if event_bytes > _SSE_EVENT_MAX_BYTES:
+                raise ValueError(f"Upstream SSE event exceeds {_SSE_EVENT_MAX_BYTES} byte limit")
+            data_lines.append(value)
             continue
 
         # Some compatible providers emit a literal newline inside a JSON
         # string. It is invalid SSE/JSON, but retaining the continuation lets
         # json.loads(strict=False) recover it before we serialize it cleanly.
         if data_lines and field not in {"event", "id", "retry"}:
+            event_bytes += line_bytes
+            if event_bytes > _SSE_EVENT_MAX_BYTES:
+                raise ValueError(f"Upstream SSE event exceeds {_SSE_EVENT_MAX_BYTES} byte limit")
             data_lines.append(line)
 
     if data_lines:
@@ -87,6 +131,28 @@ class UpstreamClient:
         self._timeout = timeout
         self._stream_timeout = stream_timeout
         self._proxy_url = proxy_url
+        self._active_requests = 0
+        self._retired = False
+        self._close_task: asyncio.Task | None = None
+
+    def _begin_request(self) -> None:
+        self._active_requests += 1
+
+    async def _end_request(self) -> None:
+        self._active_requests = max(0, self._active_requests - 1)
+        if self._retired and self._active_requests == 0:
+            await self.close()
+
+    def retire(self) -> None:
+        self._retired = True
+        if self._active_requests:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._close_task is None or self._close_task.done():
+            self._close_task = loop.create_task(self.close())
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -121,15 +187,19 @@ class UpstreamClient:
         headers = self.adapter.get_headers(self.api_key)
 
         request = client.build_request("POST", self._chat_url, json=chat_req, headers=headers)
-        response = await send_with_connect_retries(client, request)
-        if response.status_code >= 400:
-            body = await response.aread()
-            raise httpx.HTTPStatusError(
-                f"Upstream {response.status_code}: {body.decode()[:500]}",
-                request=response.request,
-                response=response,
-            )
-        return response.json()
+        self._begin_request()
+        try:
+            response = await send_with_connect_retries(client, request)
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise httpx.HTTPStatusError(
+                    f"Upstream {response.status_code}: {body.decode()[:500]}",
+                    request=response.request,
+                    response=response,
+                )
+            return response.json()
+        finally:
+            await self._end_request()
 
     async def chat_completion_stream(self, chat_req: dict) -> AsyncIterator[dict]:
         """发送流式 Chat Completions 请求，返回 SSE 事件迭代器"""
@@ -138,25 +208,29 @@ class UpstreamClient:
         chat_req["stream"] = True
 
         request = client.build_request("POST", self._chat_url, json=chat_req, headers=headers)
-        async with stream_with_connect_retries(client, request) as response:
-            if response.status_code >= 400:
-                body = await response.aread()
-                raise httpx.HTTPStatusError(
-                    f"Upstream {response.status_code}: {body.decode()[:500]}",
-                    request=response.request,
-                    response=response,
-                )
-            async for data_str in _iter_sse_data(response):
-                if data_str.strip() == "[DONE]":
-                    break
-                yield _decode_sse_json(data_str)
+        self._begin_request()
+        try:
+            async with stream_with_connect_retries(client, request) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    raise httpx.HTTPStatusError(
+                        f"Upstream {response.status_code}: {body.decode()[:500]}",
+                        request=response.request,
+                        response=response,
+                    )
+                async for data_str in _iter_sse_data(response):
+                    if data_str.strip() == "[DONE]":
+                        break
+                    yield _decode_sse_json(data_str)
+        finally:
+            await self._end_request()
 
 
 class UpstreamClientPool:
     """Reuse upstream HTTP connections across Codex tool turns."""
 
     def __init__(self):
-        self._clients: dict[tuple, UpstreamClient] = {}
+        self._clients: OrderedDict[tuple, UpstreamClient] = OrderedDict()
 
     def get(
         self,
@@ -180,13 +254,20 @@ class UpstreamClientPool:
                 proxy_url=proxy_url,
             )
             self._clients[key] = client
+            while len(self._clients) > _UPSTREAM_CLIENT_POOL_MAX_ENTRIES:
+                _, retired = self._clients.popitem(last=False)
+                retired.retire()
+        else:
+            self._clients.move_to_end(key)
         return client
 
     async def close(self) -> None:
         clients = list(self._clients.values())
         self._clients.clear()
         for client in clients:
-            await client.close()
+            client._retired = True
+            if client._active_requests == 0:
+                await client.close()
 
 
 _client_pool = UpstreamClientPool()

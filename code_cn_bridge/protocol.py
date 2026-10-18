@@ -39,6 +39,11 @@ _REASONING_ONLY_RESPONSE_MESSAGE = (
     "Upstream thinking mode ended after reasoning without returning a final answer "
     "or a tool call."
 )
+_INCOMPLETE_STREAM_MESSAGE = "Upstream stream ended before a valid terminal finish reason."
+_INCOMPLETE_TOOL_ARGUMENTS_MESSAGE = "Upstream ended with incomplete or invalid JSON tool arguments."
+_TOOL_ARGUMENTS_MAX_BYTES = 4 * 1024 * 1024
+_TOOL_ARGUMENTS_TOTAL_MAX_BYTES = 16 * 1024 * 1024
+_STREAM_TOOL_CALLS_MAX = 128
 _TOOL_USE_GUARDRAIL_MESSAGE = (
     "When a tool is available for an action, call the tool using tool_calls. "
     "Do not print shell commands, Python scripts, JSON tool payloads, or patch text "
@@ -231,8 +236,9 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
                 "content": None,
                 "tool_calls": pending_tool_calls.copy(),
             }
-            # Kimi thinking 模型要求所有带 tool_calls 的 assistant 消息必须有 reasoning_content
-            msg["reasoning_content"] = pending_reasoning or "Tool calls."
+            # Keep the field semantics honest: an empty value is preferable to
+            # inventing reasoning text for a tool turn that had none.
+            msg["reasoning_content"] = pending_reasoning
             pending_reasoning = ""
             messages.append(msg)
             pending_tool_calls.clear()
@@ -257,7 +263,9 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
         # reasoning → 收集文本，附加到下一个 assistant 消息
         if item_type == "reasoning":
             _flush_tool_images()
-            pending_reasoning = _extract_reasoning_text(item) or pending_reasoning
+            reasoning_text = _extract_reasoning_text(item)
+            if reasoning_text:
+                pending_reasoning = f"{pending_reasoning}\n{reasoning_text}" if pending_reasoning else reasoning_text
             continue
 
         # hosted web_search 已由 Bridge 执行并体现在后续 assistant 答案中；
@@ -362,7 +370,11 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
         # assistant 消息：附加之前收集的 reasoning_content
         if role == "assistant":
             if isinstance(item.get("reasoning_content"), str):
-                msg["reasoning_content"] = item["reasoning_content"]
+                own_reasoning = item["reasoning_content"]
+                msg["reasoning_content"] = (
+                    f"{pending_reasoning}\n{own_reasoning}" if pending_reasoning and own_reasoning
+                    else own_reasoning or pending_reasoning
+                )
             elif pending_reasoning:
                 msg["reasoning_content"] = pending_reasoning
             pending_reasoning = ""
@@ -377,7 +389,11 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
     if pending_reasoning:
         for m in reversed(messages):
             if m.get("role") == "assistant":
-                m["reasoning_content"] = pending_reasoning
+                existing = m.get("reasoning_content")
+                m["reasoning_content"] = (
+                    f"{existing}\n{pending_reasoning}" if isinstance(existing, str) and existing
+                    else pending_reasoning
+                )
                 break
         pending_reasoning = ""
 
@@ -385,12 +401,12 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
 
 
 def _sanitize_tool_history(messages: list[dict]) -> list[dict]:
-    """Remove incomplete tool-call turns before sending Chat Completions history.
+    """Repair incomplete tool turns without erasing possible side effects.
 
     Responses clients can resume after an interrupted tool turn.  In that case
-    the flat input history may contain a function_call without every matching
-    function_call_output.  Chat Completions providers reject that history
-    instead of allowing the conversation to recover.
+    the flat input history may contain a call without its matching output, or
+    an output without its call. Preserve both identities and mark missing
+    execution facts explicitly for Chat providers.
     """
     sanitized: list[dict] = []
     index = 0
@@ -406,31 +422,81 @@ def _sanitize_tool_history(messages: list[dict]) -> list[dict]:
                 tool_messages.append(messages[next_index])
                 next_index += 1
 
-            outputs_by_id = {
-                tool_message.get("tool_call_id"): tool_message
-                for tool_message in tool_messages
-                if tool_message.get("tool_call_id")
-            }
-            matched_calls = [
-                tool_call for tool_call in tool_calls
-                if tool_call.get("id") in outputs_by_id
-            ]
-
-            if matched_calls:
-                assistant_message = message.copy()
-                assistant_message["tool_calls"] = matched_calls
-                sanitized.append(assistant_message)
-                sanitized.extend(outputs_by_id[tool_call["id"]] for tool_call in matched_calls)
-            elif message.get("content"):
-                assistant_message = message.copy()
-                assistant_message.pop("tool_calls", None)
-                assistant_message.pop("reasoning_content", None)
-                sanitized.append(assistant_message)
+            outputs_by_id: dict[str, list[dict]] = {}
+            for tool_message in tool_messages:
+                call_id = tool_message.get("tool_call_id")
+                if call_id:
+                    outputs_by_id.setdefault(call_id, []).append(tool_message)
+            # Keep every action identity and its arguments: a missing result
+            # does not prove that a side effect did not happen.
+            assistant_message = message.copy()
+            normalized_calls = []
+            for call_index, tool_call in enumerate(tool_calls):
+                if tool_call.get("id"):
+                    normalized_calls.append(tool_call)
+                    continue
+                call_with_identity = tool_call.copy()
+                call_with_identity["id"] = f"unknown_call_{index}_{call_index}"
+                normalized_calls.append(call_with_identity)
+            assistant_message["tool_calls"] = normalized_calls
+            sanitized.append(assistant_message)
+            consumed_output_ids: set[str] = set()
+            for tool_call in normalized_calls:
+                call_id = tool_call.get("id")
+                if call_id and call_id in outputs_by_id:
+                    sanitized.extend(outputs_by_id[call_id])
+                    consumed_output_ids.add(call_id)
+                elif call_id:
+                    sanitized.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": "Execution status unknown: the prior tool call has no persisted result. Reconcile external state before repeating it.",
+                    })
+            for output_index, tool_message in enumerate(tool_messages):
+                if tool_message.get("tool_call_id") in consumed_output_ids:
+                    continue
+                call_id = tool_message.get("tool_call_id") or f"orphan_{index}_{output_index}"
+                sanitized.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "prior_tool_call_unavailable",
+                            "arguments": json.dumps({"source": "orphan_tool_history", "execution_status": "unknown"}),
+                        },
+                    }],
+                    "reasoning_content": "",
+                })
+                normalized_tool = tool_message.copy()
+                normalized_tool["tool_call_id"] = call_id
+                sanitized.append(normalized_tool)
 
             index = next_index
             continue
 
-        if message.get("role") != "tool":
+        if message.get("role") == "tool":
+            # Preserve orphan result provenance as a tool message paired to an
+            # explicit synthetic call record, never as user-authored content.
+            call_id = message.get("tool_call_id") or f"orphan_{index}"
+            sanitized.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "prior_tool_call_unavailable",
+                        "arguments": json.dumps({"source": "orphan_tool_history", "execution_status": "unknown"}),
+                    },
+                }],
+                "reasoning_content": "",
+            })
+            normalized_tool = message.copy()
+            normalized_tool["tool_call_id"] = call_id
+            sanitized.append(normalized_tool)
+        else:
             sanitized.append(message)
         index += 1
 
@@ -1135,6 +1201,32 @@ class StreamTranslator:
             return []
         events: list[str] = []
 
+        # EOF is not a successful terminal marker. In particular, tool calls
+        # must never be finalized (and later dispatched) without valid JSON.
+        if self._finish_reason not in {"stop", "tool_calls", "function_call"}:
+            self._done = True
+            return [_sse_line({"type": "response.failed", "response": {
+                "id": self.response_id, "object": "response", "model": self.model,
+                "status": "incomplete", "output": self._output_items,
+                "error": {"message": _INCOMPLETE_STREAM_MESSAGE, "type": "incomplete_response"},
+            }})]
+
+        for buf in self._tc_buf.values():
+            try:
+                parsed_arguments = json.loads(buf["arguments"])
+            except (TypeError, ValueError):
+                parsed_arguments = None
+            raw_patch = (buf["name"] == "apply_patch" and isinstance(buf["arguments"], str)
+                         and buf["arguments"].strip().startswith("*** Begin Patch\n")
+                         and buf["arguments"].strip().endswith("*** End Patch"))
+            if not isinstance(parsed_arguments, dict) and not raw_patch:
+                self._done = True
+                return [_sse_line({"type": "response.failed", "response": {
+                    "id": self.response_id, "object": "response", "model": self.model,
+                    "status": "incomplete", "output": self._output_items,
+                    "error": {"message": _INCOMPLETE_TOOL_ARGUMENTS_MESSAGE, "type": "incomplete_tool_call"},
+                }})]
+
         events.extend(self._flush_inline_think_at_boundary())
 
         if self._reasoning_started:
@@ -1463,6 +1555,8 @@ class StreamTranslator:
         tc_id = tc.get("id", "")
 
         if tc_index not in self._tc_buf:
+            if len(self._tc_buf) >= _STREAM_TOOL_CALLS_MAX:
+                raise ValueError(f"Stream exceeds {_STREAM_TOOL_CALLS_MAX} tool calls")
             # 新的工具调用
             self._output_index += 1
             item_id = _uid("fc")
@@ -1527,6 +1621,15 @@ class StreamTranslator:
 
         # 参数增量
         if fn_args:
+            new_argument_bytes = len((buf["arguments"] + fn_args).encode("utf-8", errors="replace"))
+            total_argument_bytes = sum(
+                len(item["arguments"].encode("utf-8", errors="replace"))
+                for item in self._tc_buf.values()
+            ) + len(str(fn_args).encode("utf-8", errors="replace"))
+            if new_argument_bytes > _TOOL_ARGUMENTS_MAX_BYTES:
+                raise ValueError(f"Tool arguments exceed {_TOOL_ARGUMENTS_MAX_BYTES} byte limit")
+            if total_argument_bytes > _TOOL_ARGUMENTS_TOTAL_MAX_BYTES:
+                raise ValueError(f"Tool argument buffers exceed {_TOOL_ARGUMENTS_TOTAL_MAX_BYTES} byte limit")
             buf["arguments"] += fn_args
             if buf["item_index"] < len(self._output_items):
                 if not self._is_custom_tool_name(buf["name"]):

@@ -329,7 +329,25 @@ def _repair_orphan_tool_outputs(input_items: list[Any]) -> list[Any]:
         if isinstance(item, dict) and item.get("type") in _TOOL_OUTPUT_TYPES:
             output_ids = _tool_item_ids(item)
             if not output_ids or call_ids.isdisjoint(output_ids):
-                repaired.append(_orphan_tool_output_message(item))
+                # Preserve the result as tool-originated data. A synthetic call
+                # record retains the linkage and explicitly marks its action as
+                # unknown, instead of upgrading tool text into a user message.
+                call_id = next(iter(sorted(output_ids)), f"orphan_{len(repaired)}")
+                call_item_id = "fc_" + hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:32]
+                repaired.append({
+                    "type": "function_call",
+                    "id": call_item_id,
+                    "call_id": call_id,
+                    "name": "prior_tool_call_unavailable",
+                    "arguments": json.dumps({
+                        "source": "orphan_tool_history",
+                        "execution_status": "unknown",
+                    }),
+                    "status": "completed",
+                })
+                normalized_output = copy.deepcopy(item)
+                normalized_output.setdefault("call_id", call_id)
+                repaired.append(normalized_output)
                 continue
         repaired.append(item)
     return repaired
@@ -484,7 +502,22 @@ def prepare_chat_responses_payload(
     current_input = normalized.get("input")
     if not isinstance(current_input, list):
         return normalized, False
+    missing_context_notice = []
+    if previous_id is not None and prior_input is None:
+        missing_context_notice = [{
+            "type": "message",
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": (
+                    "The bridge could not restore history for the supplied previous_response_id. "
+                    "Use only history present in this request. Earlier tool side effects may have "
+                    "occurred; reconcile external state before repeating an operation."
+                ),
+            }],
+        }]
     normalized["input"] = _repair_orphan_tool_outputs([
+        *missing_context_notice,
         *(prior_input or []),
         *current_input,
     ])

@@ -103,6 +103,17 @@ def test_sse_observer_accepts_split_utf8_and_multiline_data():
     assert events == [{"type": "中文"}]
 
 
+def test_sse_observer_rejects_oversized_unterminated_event():
+    observer = SSEJsonObserver()
+    with patch("code_cn_bridge.sse_observer._SSE_PENDING_MAX_BYTES", 16):
+        try:
+            observer.feed(b"data: " + b"x" * 32)
+        except ValueError as exc:
+            assert "SSE line exceeds" in str(exc)
+        else:
+            raise AssertionError("oversized SSE line was accepted")
+
+
 def test_old_downstream_cannot_hide_new_account_models():
     observed = []
 

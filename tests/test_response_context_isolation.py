@@ -200,6 +200,19 @@ class ResponseContextIsolationTests(unittest.TestCase):
         self.assertNotIn("previous_response_id", native_payload)
         self.assertEqual(len(native_payload["input"]), 1)
 
+    def test_chat_context_cache_miss_is_explicit_and_warns_about_prior_side_effects(self):
+        payload, replayed = prepare_chat_responses_payload({
+            "previous_response_id": "resp_context_evicted",
+            "input": [{"type": "message", "role": "user", "content": "continue"}],
+        }, "deepseek-chat")
+
+        self.assertFalse(replayed)
+        self.assertNotIn("previous_response_id", payload)
+        notice = payload["input"][0]
+        self.assertEqual(notice["role"], "developer")
+        self.assertIn("could not restore history", notice["content"][0]["text"])
+        self.assertIn("reconcile external state", notice["content"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

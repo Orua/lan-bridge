@@ -24,6 +24,22 @@ def _payloads(events: list[str]) -> list[dict]:
 
 
 class StabilityUpgradeTests(unittest.TestCase):
+    def test_reasoning_only_retry_preserves_user_thinking_configuration(self):
+        original = {
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "reasoning_effort": "high",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": "answer"}],
+        }
+
+        retry = server._build_reasoning_only_retry_request(original)
+
+        self.assertEqual(retry["thinking"], original["thinking"])
+        self.assertEqual(retry["reasoning_effort"], "high")
+        self.assertEqual(retry["max_tokens"], 512)
+        self.assertEqual(original["max_tokens"], 256)
+        self.assertIn("requested thinking configuration", retry["messages"][0]["content"])
+
     def test_stream_failure_is_contained_after_response_headers(self):
         import asyncio
 

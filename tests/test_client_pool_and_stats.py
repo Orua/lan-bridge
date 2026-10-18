@@ -32,6 +32,15 @@ class UpstreamClientPoolTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "Malformed upstream SSE JSON"):
             _decode_sse_json('{"choices": [invalid]}')
 
+    async def test_sse_event_buffer_is_bounded(self):
+        class FakeResponse:
+            async def aiter_lines(self):
+                yield "data: " + ("x" * 32)
+
+        with patch("code_cn_bridge.client._SSE_EVENT_MAX_BYTES", 16):
+            with self.assertRaisesRegex(ValueError, "SSE event exceeds"):
+                _ = [payload async for payload in _iter_sse_data(FakeResponse())]
+
     async def test_reuses_client_for_matching_connection_settings(self):
         adapter = DeepSeekAdapter()
         pool = UpstreamClientPool()
@@ -90,6 +99,35 @@ class UpstreamClientPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proxied._proxy_url, "http://127.0.0.1:19828")
         direct.close = AsyncMock()
         proxied.close = AsyncMock()
+        await pool.close()
+
+    async def test_pool_evicts_old_configurations_at_a_finite_limit(self):
+        adapter = DeepSeekAdapter()
+        pool = UpstreamClientPool()
+        with patch("code_cn_bridge.client._UPSTREAM_CLIENT_POOL_MAX_ENTRIES", 2):
+            first = pool.get("first", adapter, "key", 120, 600)
+            second = pool.get("second", adapter, "key", 120, 600)
+            third = pool.get("third", adapter, "key", 120, 600)
+
+        self.assertEqual(len(pool._clients), 2)
+        self.assertTrue(first._retired)
+        self.assertFalse(second._retired)
+        self.assertFalse(third._retired)
+        await pool.close()
+
+    async def test_pool_does_not_close_evicted_client_until_active_request_drains(self):
+        adapter = DeepSeekAdapter()
+        pool = UpstreamClientPool()
+        with patch("code_cn_bridge.client._UPSTREAM_CLIENT_POOL_MAX_ENTRIES", 1):
+            active = pool.get("active", adapter, "key", 120, 600)
+            active._begin_request()
+            pool.get("replacement", adapter, "key", 120, 600)
+
+        self.assertTrue(active._retired)
+        self.assertEqual(active._active_requests, 1)
+        self.assertIsNone(active._close_task)
+        await active._end_request()
+        self.assertEqual(active._active_requests, 0)
         await pool.close()
 
 

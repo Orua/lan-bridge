@@ -664,7 +664,9 @@ class UnifiedRoutingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(captured), 1)
         self.assertNotIn("previous_response_id", captured[0])
-        self.assertEqual(captured[0]["input"][0]["type"], "message")
+        self.assertEqual(captured[0]["input"][0]["type"], "function_call")
+        self.assertEqual(captured[0]["input"][0]["call_id"], "call_old")
+        self.assertEqual(captured[0]["input"][1]["type"], "custom_tool_call_output")
 
     def test_native_context_cache_expands_incremental_tool_continuation(self):
         response_id = "resp_cached_tool_round_trip"
@@ -913,18 +915,21 @@ class UnifiedRoutingTests(unittest.TestCase):
             }],
         }, "gpt-5.6-sol")
 
-        self.assertEqual(payload["input"][0]["type"], "message")
-        self.assertEqual(payload["input"][0]["role"], "user")
-        self.assertIn("existing session result", payload["input"][0]["content"][0]["text"])
-        self.assertNotIn("custom_tool_call_output", json.dumps(payload["input"]))
+        self.assertEqual(payload["input"][0]["type"], "function_call")
+        self.assertEqual(payload["input"][0]["name"], "prior_tool_call_unavailable")
+        self.assertEqual(payload["input"][0]["call_id"], "call_missing")
+        self.assertEqual(payload["input"][1]["type"], "custom_tool_call_output")
+        self.assertIn("existing session result", json.dumps(payload["input"]))
 
     def test_native_payload_converts_tool_output_without_an_id(self):
         payload = normalize_native_payload({
             "input": [{"type": "function_call_output", "output": "missing id result"}],
         }, "gpt-5.6-sol")
 
-        self.assertEqual(payload["input"][0]["type"], "message")
-        self.assertIn("missing id result", payload["input"][0]["content"][0]["text"])
+        self.assertEqual(payload["input"][0]["type"], "function_call")
+        self.assertEqual(payload["input"][0]["name"], "prior_tool_call_unavailable")
+        self.assertEqual(payload["input"][1]["type"], "function_call_output")
+        self.assertEqual(payload["input"][1]["output"], "missing id result")
 
     def test_catalog_merges_custom_text_models_without_generation_models(self):
         cfg = FakeConfig()
