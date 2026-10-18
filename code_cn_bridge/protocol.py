@@ -360,8 +360,11 @@ def _map_input_to_messages(input_items: list[dict]) -> list[dict]:
                 msg["content"] = None
 
         # assistant 消息：附加之前收集的 reasoning_content
-        if role == "assistant" and pending_reasoning:
-            msg["reasoning_content"] = pending_reasoning
+        if role == "assistant":
+            if isinstance(item.get("reasoning_content"), str):
+                msg["reasoning_content"] = item["reasoning_content"]
+            elif pending_reasoning:
+                msg["reasoning_content"] = pending_reasoning
             pending_reasoning = ""
 
         messages.append(msg)

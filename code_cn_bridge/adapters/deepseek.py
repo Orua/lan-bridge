@@ -51,6 +51,14 @@ class DeepSeekAdapter(BaseAdapter):
             chat_req["thinking"] = {"type": "disabled"}
             chat_req.pop("reasoning_effort", None)
 
+        # Thinking + tools requires this field on every replayed assistant
+        # message, including commentary without a tool call. Preserve actual
+        # reasoning verbatim; an absent block represents no reasoning text.
+        if chat_req.get("thinking", {}).get("type") == "enabled" and chat_req.get("tools"):
+            for message in chat_req.get("messages", []):
+                if message.get("role") == "assistant" and message.get("reasoning_content") is None:
+                    message["reasoning_content"] = ""
+
         # DeepSeek 对 tool 格式有要求，确保 function 字段存在
         tools = chat_req.get("tools")
         if tools:

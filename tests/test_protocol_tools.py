@@ -278,6 +278,23 @@ class ProtocolToolTests(unittest.TestCase):
         self.assertEqual(request["thinking"], {"type": "disabled"})
         self.assertNotIn("reasoning_effort", request)
 
+    def test_deepseek_thinking_tool_history_retains_reasoning_for_commentary_and_tools(self):
+        request = translate_request({
+            "input": [
+                {"role": "user", "content": "Read a value, then continue."},
+                {"role": "assistant", "content": "I will read it."},
+                {"role": "assistant", "content": "Use the original plan.", "reasoning_content": "original reasoning"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Read exactly once."}]},
+                {"type": "function_call", "name": "read_value", "call_id": "call_1", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+            ],
+            "reasoning": {"effort": "low"},
+            "tools": [{"type": "function", "name": "read_value", "parameters": {"type": "object", "properties": {}}}],
+        }, self.adapter, "deepseek-flash")
+        assistants = [message for message in request["messages"] if message["role"] == "assistant"]
+        self.assertEqual([message["reasoning_content"] for message in assistants], ["", "original reasoning", "Read exactly once."])
+        self.assertEqual(request["thinking"], {"type": "enabled"})
+
     def test_named_deepseek_provider_applies_compat_to_generic_adapter(self):
         request = {
             "model": "deepseek-v4-pro",
