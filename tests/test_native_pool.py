@@ -29,13 +29,16 @@ class SocketUpstream:
 
     async def __aexit__(self, *args):
         self.server.close()
-        await self.server.wait_closed()
         for writer in tuple(self.writers):
             writer.close()
         if self.tasks:
             for task in tuple(self.tasks):
                 task.cancel()
             await asyncio.gather(*self.tasks, return_exceptions=True)
+        # close() already stops the listener. Python 3.12's Proactor server
+        # wait_closed can wait forever after an intentionally reset peer;
+        # each accepted handler and writer is explicitly closed above.
+        assert not self.server.is_serving()
 
     async def handle(self, reader, writer):
         self.accepts += 1
