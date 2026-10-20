@@ -62,7 +62,8 @@ async def measure(client, url, headers, payload, route, index):
             row["first_tool_ms"] = row["first_tool_ms"] or elapsed
         if kind == "response.completed":
             row["completed"] = True
-            row["usage"] = event.get("response", {}).get("usage")
+            usage = event.get("response", {}).get("usage") or {}
+            row["usage"] = {key: usage[key] for key in ("input_tokens", "output_tokens", "total_tokens", "input_tokens_details", "output_tokens_details") if key in usage}
         if kind in {"error", "response.failed", "response.incomplete"}:
             row["failed"] = True
 
@@ -123,7 +124,7 @@ async def main(args):
                             finally:
                                 await client.aclose()
                         else:
-                            row = await measure(bridge, "http://127.0.0.1:8765/v1/responses", {"authorization": "Bearer " + key}, payload, route, pair)
+                            row = await measure(bridge, args.bridge_url.rstrip("/") + "/v1/responses", {"authorization": "Bearer " + key}, payload, route, pair)
                     with (output / "requests.jsonl").open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(row) + "\n")
                     print(json.dumps(row), flush=True)
@@ -139,7 +140,10 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["paired", "bridge"], default="paired")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--deadline", type=int, default=300)
+    parser.add_argument("--bridge-url", default="http://127.0.0.1:8765")
     args = parser.parse_args()
     if not 1 <= args.samples <= 10 or not 1 <= args.deadline <= 600:
         parser.error("maximum 10 samples per route, 600 seconds")
+    if httpx.URL(args.bridge_url).host != "127.0.0.1":
+        parser.error("bridge probe must remain on loopback")
     asyncio.run(main(args))
