@@ -6,6 +6,8 @@ server:
   codex_official_proxy_url: ""
   native_codex_base_url: https://chatgpt.com/backend-api/codex
   native_stream_timeout: 600
+  # Reuse official native HTTP connections; false restores per-request clients.
+  native_connection_pool: true
   # Disabled by default. When enabled, LAN BRIDGE reads the bridge host's
   # file-based Codex login; clients authenticate with a managed bridge key.
   native_auth_injection:
