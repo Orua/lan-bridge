@@ -346,6 +346,19 @@ first-visible-token measurement. A client cancellation is logged as 499;
 upstream failure events, transport failures, or a stream without a terminal
 event are logged as 502. Original native SSE bytes are forwarded unchanged.
 
+### Client-owned conversation history
+
+LAN BRIDGE does not automatically truncate historical tool results or reasoning,
+or deduplicate client instructions and environment messages. This applies to
+Responses-to-Chat translation as well as native/provider Responses routes and
+continuation replay. Clients choose what history to retain or compact. The
+explicit `/v1/responses/compact` endpoint remains available when a client requests
+it; oversized upstream requests are not silently shortened to make them fit.
+
+对话历史由客户端管理。桥接器不再自动裁剪历史工具结果、截短推理或去重客户端指令及
+环境消息；缓存续聊也保留完整内容。客户端主动调用的 `/v1/responses/compact` 仍可使用，
+超过上游限制时保留错误语义，不通过静默删减历史来规避限制。
+
 ### Access keys and usage
 
 The desktop **Access Keys** page creates, disables, rotates, and deletes bridge

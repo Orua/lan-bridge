@@ -1106,163 +1106,6 @@ def _audit_chat_request_summary(chat_req: dict) -> dict:
     }
 
 
-def _text_len(value) -> int:
-    if isinstance(value, str):
-        return len(value)
-    if isinstance(value, list):
-        total = 0
-        for item in value:
-            if isinstance(item, dict):
-                total += _text_len(item.get("text", ""))
-                total += _text_len(item.get("input", ""))
-                total += _text_len(item.get("output", ""))
-            else:
-                total += _text_len(item)
-        return total
-    if isinstance(value, dict):
-        return sum(_text_len(item) for item in value.values())
-    return 0
-
-
-def _compact_historical_tool_outputs(
-    input_items: list[dict] | None,
-    keep_recent: int = 4,
-    max_chars: int = 4000,
-) -> dict:
-    items = input_items or []
-    tool_output_types = {
-        "function_call_output",
-        "custom_tool_call_output",
-        "tool_search_output",
-        "tool_result",
-    }
-    output_indices = [
-        index for index, item in enumerate(items)
-        if isinstance(item, dict) and item.get("type") in tool_output_types
-    ]
-    compact_before = set(output_indices[:-keep_recent]) if keep_recent > 0 else set(output_indices)
-    trimmed_items = 0
-    chars_before = 0
-    chars_after = 0
-
-    for index in compact_before:
-        item = items[index]
-        for field in ("output", "content"):
-            if field not in item:
-                continue
-            value = item[field]
-            before = _text_len(value)
-            if before <= max_chars:
-                continue
-            if isinstance(value, str):
-                marker = f"\n[bridge compacted historical tool output: {before} chars]\n"
-                payload_budget = max(0, max_chars - len(marker))
-                head = payload_budget // 2
-                tail = payload_budget - head
-                item[field] = value[:head] + marker + (value[-tail:] if tail else "")
-            else:
-                item[field] = f"[bridge compacted historical tool output: {before} chars]"
-            after = _text_len(item[field])
-            trimmed_items += 1
-            chars_before += before
-            chars_after += after
-
-    return {
-        "trimmed_items": trimmed_items,
-        "chars_before": chars_before,
-        "chars_after": chars_after,
-    }
-
-
-def _replay_message_compaction_key(item: dict) -> tuple[str, str] | None:
-    """Identify replay-only messages whose older copies are stale or redundant."""
-    if item.get("type") not in (None, "message"):
-        return None
-    role = str(item.get("role") or "")
-    text = _extract_text_content(item.get("content", "")).strip()
-    if not text:
-        return None
-    if role in {"system", "developer"}:
-        if "<skills_instructions>" in text:
-            return ("dynamic", "skills_instructions")
-        if "<app-context>" in text:
-            return ("dynamic", "app_context")
-        return (role, text)
-    if role == "user":
-        if "<environment_context>" in text:
-            return ("dynamic", "environment_context")
-        if "<turn_aborted>" in text:
-            return ("dynamic", "turn_aborted")
-    return None
-
-
-def _compact_chat_replay_history(input_items: list[dict] | None) -> dict:
-    """Bound stateless Chat replay without changing current user/tool semantics."""
-    items = input_items or []
-    keep_indices: set[int] = set()
-    seen_keys: set[tuple[str, str]] = set()
-    deduped_items = 0
-
-    for index in range(len(items) - 1, -1, -1):
-        item = items[index]
-        if not isinstance(item, dict):
-            keep_indices.add(index)
-            continue
-        key = _replay_message_compaction_key(item)
-        if key is None or key not in seen_keys:
-            keep_indices.add(index)
-            if key is not None:
-                seen_keys.add(key)
-        else:
-            deduped_items += 1
-
-    if deduped_items:
-        items[:] = [item for index, item in enumerate(items) if index in keep_indices]
-
-    reasoning_indices = [
-        index for index, item in enumerate(items)
-        if isinstance(item, dict) and item.get("type") == "reasoning"
-    ]
-    compact_reasoning = set(reasoning_indices[:-2])
-    reasoning_items = 0
-    reasoning_chars_before = 0
-    reasoning_chars_after = 0
-    reasoning_limit = 2000
-    for index in compact_reasoning:
-        item = items[index]
-        text = "\n".join(
-            str(part.get("text") or "")
-            for field in ("summary", "content")
-            for part in (item.get(field) or [])
-            if isinstance(part, dict) and part.get("text")
-        ).strip()
-        if len(text) <= reasoning_limit:
-            continue
-        marker = f"\n[bridge compacted historical reasoning: {len(text)} chars]\n"
-        payload_budget = max(0, reasoning_limit - len(marker))
-        head = payload_budget // 2
-        tail = payload_budget - head
-        compacted = text[:head] + marker + (text[-tail:] if tail else "")
-        item.clear()
-        item.update({
-            "type": "reasoning",
-            "summary": [{"type": "summary_text", "text": compacted}],
-        })
-        reasoning_items += 1
-        reasoning_chars_before += len(text)
-        reasoning_chars_after += len(compacted)
-
-    tool_stats = _compact_historical_tool_outputs(items, keep_recent=6, max_chars=2000)
-    return {
-        "trimmed_items": tool_stats["trimmed_items"] + reasoning_items + deduped_items,
-        "chars_before": tool_stats["chars_before"] + reasoning_chars_before,
-        "chars_after": tool_stats["chars_after"] + reasoning_chars_after,
-        "deduped_items": deduped_items,
-        "reasoning_items": reasoning_items,
-        "tool_output_items": tool_stats["trimmed_items"],
-    }
-
-
 def _latest_user_text(input_items: list[dict] | None) -> str:
     for item in reversed(input_items or []):
         if item.get("type") != "message" or item.get("role") != "user":
@@ -4423,17 +4266,10 @@ def create_app(verbose: bool = False) -> FastAPI:
                 "content": [{"type": "input_text", "text": body["input"]}],
             }]
 
-        compacted = _compact_historical_tool_outputs(body.get("input", []) or [])
         input_tools = _responses_tool_summary(body.get("tools"))
         chat_tools = ""
         verbose = logger.isEnabledFor(logging.DEBUG)
         logger.info("Responses tools: %s", input_tools or "(none)")
-        if compacted["trimmed_items"]:
-            _audit_event(
-                "responses.context_compacted",
-                request_id,
-                **compacted,
-            )
         _audit_event(
             "responses.received",
             request_id,
@@ -4488,14 +4324,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                 content=build_error_response(str(exc), exc.code, 409),
                 status_code=409,
             )
-        replay_compacted = _compact_chat_replay_history(body.get("input", []) or [])
-        if replay_compacted["trimmed_items"]:
-            _audit_event(
-                "responses.context_compacted",
-                request_id,
-                phase="chat_replay",
-                **replay_compacted,
-            )
+        # The client owns history retention and compaction. Preserve replayed
+        # tool results, reasoning and repeated instructions without trimming.
         chat_context_input = copy.deepcopy(body.get("input", []) or [])
         _audit_event(
             "responses.chat_context_prepared",

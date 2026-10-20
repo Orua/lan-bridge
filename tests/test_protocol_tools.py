@@ -19,8 +19,6 @@ from code_cn_bridge.server import _route_vision
 from code_cn_bridge.server import _buffered_responses_sse
 from code_cn_bridge.server import _apply_named_provider_chat_compat
 from code_cn_bridge.server import _classify_image_generation_intent
-from code_cn_bridge.server import _compact_chat_replay_history
-from code_cn_bridge.server import _compact_historical_tool_outputs
 from code_cn_bridge.server import _extract_text_content
 from code_cn_bridge.server import _extract_image_gen_prompt_from_chat_response
 from code_cn_bridge.server import _extract_generated_image_reference
@@ -807,42 +805,41 @@ class ProtocolToolTests(unittest.TestCase):
             "input": [{"type": "message", "role": "user", "content": "make something"}],
         }, True))
 
-    def test_compacts_only_old_large_tool_outputs(self):
-        items = [
-            {"type": "function_call_output", "output": "a" * 9000},
-            {"type": "function_call_output", "output": "b" * 9000},
-            {"type": "function_call_output", "output": "c" * 9000},
-        ]
+    def test_translates_large_historical_tool_outputs_without_trimming(self):
+        outputs = ["a" * 9000 + f"MIDDLE_EVIDENCE_{index}" + "z" * 9000 for index in range(8)]
+        items = []
+        for index, output in enumerate(outputs):
+            items.extend([
+                {"type": "function_call", "name": "probe", "call_id": f"call_{index}", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": f"call_{index}", "output": output},
+            ])
+        before = json.dumps(items)
+        result = translate_request({"input": items}, DeepSeekAdapter(), "deepseek-flash")
+        self.assertEqual([m["content"] for m in result["messages"] if m["role"] == "tool"], outputs)
+        self.assertEqual(json.dumps(items), before)
 
-        result = _compact_historical_tool_outputs(items, keep_recent=1, max_chars=1000)
-
-        self.assertEqual(result["trimmed_items"], 2)
-        self.assertLessEqual(len(items[0]["output"]), 1000)
-        self.assertLessEqual(len(items[1]["output"]), 1000)
-        self.assertEqual(items[2]["output"], "c" * 9000)
-
-    def test_chat_replay_deduplicates_dynamic_context_and_bounds_old_reasoning(self):
+    def test_translates_all_dynamic_context_and_full_old_reasoning(self):
+        reasoning = "r" * 5000 + "MIDDLE_REASONING_EVIDENCE" + "s" * 5000
         items = [
             {"type": "message", "role": "developer", "content": "<skills_instructions>old</skills_instructions>"},
             {"type": "message", "role": "user", "content": "<environment_context>old</environment_context>"},
-            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "r" * 9000}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": reasoning}]},
+            {"type": "message", "role": "assistant", "content": "earlier answer"},
             {"type": "message", "role": "developer", "content": "<skills_instructions>new</skills_instructions>"},
             {"type": "message", "role": "user", "content": "<environment_context>new</environment_context>"},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "recent"}]},
+            {"type": "message", "role": "assistant", "content": "recent answer"},
             {"type": "reasoning", "summary": [{"type": "summary_text", "text": "latest"}]},
+            {"type": "message", "role": "assistant", "content": "latest answer"},
         ]
-
-        result = _compact_chat_replay_history(items)
-
-        serialized = json.dumps(items)
-        self.assertNotIn("old</skills_instructions>", serialized)
-        self.assertNotIn("old</environment_context>", serialized)
-        self.assertIn("new</skills_instructions>", serialized)
-        self.assertIn("new</environment_context>", serialized)
-        old_reasoning = next(item for item in items if item.get("type") == "reasoning")
-        self.assertLessEqual(len(old_reasoning["summary"][0]["text"]), 2000)
-        self.assertEqual(result["deduped_items"], 2)
-        self.assertEqual(result["reasoning_items"], 1)
+        before = json.dumps(items)
+        result = translate_request({"input": items, "reasoning": {"effort": "medium"}}, DeepSeekAdapter(), "deepseek-flash")
+        texts = [m.get("content") for m in result["messages"]]
+        for item in items:
+            if item.get("type") == "message":
+                self.assertIn(item["content"], texts)
+        self.assertIn(reasoning, [m.get("reasoning_content") for m in result["messages"]])
+        self.assertEqual(json.dumps(items), before)
 
     def test_strips_too_small_data_images_before_vision_routing(self):
         one_by_one_png = (

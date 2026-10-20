@@ -1309,6 +1309,87 @@ class UnifiedRoutingTests(unittest.TestCase):
         self.assertTrue(replayed)
         self.assertEqual(len(payload["input"]), 3)
 
+    @staticmethod
+    def _complete_history_fixture():
+        items = [
+            {"type": "message", "role": "developer", "content": "<skills_instructions>old skills</skills_instructions>"},
+            {"type": "message", "role": "developer", "content": "<skills_instructions>new skills</skills_instructions>"},
+            {"type": "message", "role": "system", "content": "REPEATED_CLIENT_INSTRUCTION"},
+            {"type": "message", "role": "system", "content": "REPEATED_CLIENT_INSTRUCTION"},
+            {"type": "message", "role": "user", "content": "<environment_context>old environment</environment_context>"},
+            {"type": "message", "role": "user", "content": "<environment_context>new environment</environment_context>"},
+        ]
+        for index in range(8):
+            if index < 3:
+                items.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": "r" * 5000 + f"MIDDLE_REASONING_{index}" + "s" * 5000}]})
+            items.extend([
+                {"type": "function_call", "name": "probe", "call_id": f"preserve_call_{index}", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": f"preserve_call_{index}", "output": "a" * 10000 + f"MIDDLE_TOOL_EVIDENCE_{index}" + "z" * 10000},
+            ])
+        items.append({"type": "message", "role": "user", "content": "Read the supplied history and answer OK."})
+        return items
+
+    def test_custom_chat_routes_preserve_full_client_history_streaming_and_non_streaming(self):
+        for provider, adapter_name in (("deepseek", "deepseek"), ("aliyun", "qwen"), ("xai", "openai")):
+            for streaming in (False, True):
+                with self.subTest(provider=provider, streaming=streaming):
+                    cfg = FakeConfig()
+                    cfg.providers[provider] = {"adapter": adapter_name, "api_key": "FAKE_KEY", "wire_api": "chat"}
+                    cfg.model_mapping["history-test"] = {"provider": provider, "target": "history-test", "route_kind": "custom", "enabled": True}
+                    captured = []
+
+                    async def complete(body):
+                        captured.append(body)
+                        return {"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}
+
+                    async def stream(body):
+                        captured.append(body)
+                        yield {"choices": [{"index": 0, "delta": {"content": "OK"}, "finish_reason": "stop"}]}
+
+                    upstream = SimpleNamespace(_chat_url="https://fixture.invalid/chat/completions", chat_completion=complete, chat_completion_stream=stream)
+                    history = self._complete_history_fixture()
+                    with patch.object(server, "get_config", return_value=cfg), patch.object(server, "get_upstream_client", return_value=upstream), patch.object(server, "_audit_event"):
+                        client = TestClient(server.create_app())
+                        response = client.post("/v1/responses", json={"model": "history-test", "input": history, "stream": streaming, "reasoning": {"effort": "medium"}})
+                        self.assertEqual(response.status_code, 200)
+                        if streaming:
+                            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+                            previous_id = next(event["response"]["id"] for event in events if event.get("type") == "response.completed")
+                        else:
+                            previous_id = response.json()["id"]
+                        continuation = client.post("/v1/responses", json={"model": "history-test", "previous_response_id": previous_id, "input": [{"type": "message", "role": "user", "content": "Continue with the same complete evidence."}], "stream": streaming})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(continuation.status_code, 200)
+                    self.assertEqual(len(captured), 2)
+                    for upstream_request in captured:
+                        messages = upstream_request["messages"]
+                        outputs = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
+                        self.assertEqual(outputs, {item["call_id"]: item["output"] for item in history if item.get("type") == "function_call_output"})
+                        reasoning = "\n".join(m.get("reasoning_content", "") for m in messages)
+                        for item in history:
+                            if item.get("type") == "reasoning":
+                                self.assertIn(item["summary"][0]["text"], reasoning)
+                        texts = [m.get("content") for m in messages]
+                        for item in history:
+                            if item.get("type") == "message":
+                                self.assertIn(item["content"], texts)
+                        self.assertEqual(texts.count("REPEATED_CLIENT_INSTRUCTION"), 2)
+                    self.assertNotIn("bridge compacted historical", json.dumps(captured))
+
+    def test_native_and_provider_responses_routes_preserve_full_client_history(self):
+        for native in (True, False):
+            with self.subTest(native=native):
+                cfg = FakeConfig()
+                if not native:
+                    cfg.model_mapping["history-responses"] = {"provider": "deepseek", "target": "history-test", "upstream_protocol": "responses", "enabled": True}
+                history = self._complete_history_fixture()
+                upstream = AsyncMock(return_value=JSONResponse({"id": "resp_preserved", "output": []}))
+                name = "proxy_native_responses" if native else "proxy_provider_responses"
+                with patch.object(server, "get_config", return_value=cfg), patch.object(server, name, new=upstream), patch.object(server, "_audit_event"):
+                    response = TestClient(server.create_app()).post("/v1/responses", json={"model": "gpt-5.6-sol" if native else "history-responses", "input": history, "stream": False})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(upstream.await_args.args[1 if native else 0]["input"], history)
+
     def test_native_compaction_endpoint_uses_official_compact_path(self):
         cfg = FakeConfig()
         native_response = JSONResponse({"output": []})
