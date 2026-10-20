@@ -600,6 +600,12 @@ def _native_client(config, timeout: httpx.Timeout) -> httpx.AsyncClient:
     proxy_url = ""
     if _is_official_openai_url(_native_base_url(config)):
         proxy_url = str(server.get("codex_official_proxy_url") or "").strip()
+    pool = getattr(config, "_native_http_pool", None)
+    if pool is not None:
+        if server.get("native_connection_pool", True):
+            url = httpx.URL(_native_base_url(config))
+            return pool.lease((url.scheme, url.host, url.port), proxy_url, timeout)
+        pool.retire()
     return make_native_async_client(timeout=timeout, proxy_url=proxy_url)
 
 

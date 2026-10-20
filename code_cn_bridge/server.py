@@ -44,6 +44,7 @@ from .protocol import (
 )
 from .client import UpstreamClient, close_upstream_clients, get_upstream_client
 from .http_utils import make_async_client
+from .native_pool import NativeClientPool
 from .native_proxy import (
     NativeUpstreamHTTPError,
     ResponseContextAccessError,
@@ -3878,6 +3879,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                     logger.exception("配置热加载失败，继续使用上一份有效配置")
 
         watcher = asyncio.create_task(watch_config(), name="bridge-config-watcher")
+        native_pool = NativeClientPool()
+        cfg._native_http_pool = native_pool
         try:
             yield
         finally:
@@ -3887,6 +3890,9 @@ def create_app(verbose: bool = False) -> FastAPI:
             except asyncio.CancelledError:
                 pass
             await close_upstream_clients()
+            await native_pool.close()
+            if getattr(cfg, "_native_http_pool", None) is native_pool:
+                del cfg._native_http_pool
             logger.info("LAN BRIDGE 已关闭")
 
     app = FastAPI(
