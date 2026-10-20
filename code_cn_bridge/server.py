@@ -44,7 +44,7 @@ from .protocol import (
 )
 from .client import UpstreamClient, close_upstream_clients, get_upstream_client
 from .http_utils import make_async_client
-from .native_pool import NativeClientPool
+from .native_pool import NativeClientPool, NativePoolBusy
 from .native_proxy import (
     NativeUpstreamHTTPError,
     ResponseContextAccessError,
@@ -104,6 +104,15 @@ def _suppressed_request_stats():
 def _request_bridge_principal(request: Request) -> BridgePrincipal:
     principal = getattr(request.state, "bridge_principal", None)
     return principal if isinstance(principal, BridgePrincipal) else current_bridge_principal()
+
+
+def _native_busy_response(start_time, model, endpoint, stream, request_id, target_model):
+    message = str(NativePoolBusy())
+    _record_request(start_time, model, endpoint, 503, bool(stream), message,
+                    provider="native_codex", target_model=target_model, upstream_api="responses")
+    _audit_event("native.capacity_rejected", request_id, model=model, error_code=NativePoolBusy.code)
+    return JSONResponse(content=build_error_response(message, NativePoolBusy.code, 503),
+                        status_code=503, headers={"Retry-After": "2"})
 
 
 def _model_access_response(principal: BridgePrincipal, model: str) -> JSONResponse | None:
@@ -3722,7 +3731,12 @@ def create_app(verbose: bool = False) -> FastAPI:
                     logger.exception("配置热加载失败，继续使用上一份有效配置")
 
         watcher = asyncio.create_task(watch_config(), name="bridge-config-watcher")
-        native_pool = NativeClientPool()
+        pool_settings = cfg.data.get("server", {})
+        native_pool = NativeClientPool(
+            max_active=int(pool_settings.get("native_max_active", 32)),
+            max_waiters=int(pool_settings.get("native_max_waiters", 128)),
+            wait_timeout=float(pool_settings.get("native_pool_wait_timeout", 10)),
+        )
         cfg._native_http_pool = native_pool
         try:
             yield
@@ -3918,6 +3932,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                 content=build_error_response(str(exc), exc.code, 409),
                 status_code=409,
             )
+        except NativePoolBusy:
+            return _native_busy_response(start_time, model, "responses/compact", False, request_id, route.target_model)
         except NativeUpstreamHTTPError as exc:
             message = str(exc)
             _record_request(
@@ -4080,6 +4096,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                         provider="native_codex", target_model=target_model, client_ip=request_client_ip,
                     )
                 return _bind_stream_principal(response, principal)
+            except NativePoolBusy:
+                return _native_busy_response(start_time, model, "responses", stream, request_id, target_model)
             except ResponseContextAccessError as exc:
                 _record_request(
                     start_time, model, "responses", 409, stream, str(exc),
@@ -4113,8 +4131,15 @@ def create_app(verbose: bool = False) -> FastAPI:
                     content=build_error_response(error_msg, "upstream_error", exc.status_code),
                     status_code=exc.status_code,
                 )
+            except httpx.TransportError as exc:
+                error_msg = str(exc) or type(exc).__name__
+                logger.warning("Native upstream transport failure type=%s request_id=%s", type(exc).__name__, request_id)
+                _audit_event("responses.native_failed", request_id, model=model, error=error_msg, error_type=type(exc).__name__)
+                _record_request(start_time, model, "responses", 502, stream, error_msg,
+                                provider="native_codex", target_model=target_model, client_ip=request_client_ip)
+                return JSONResponse(content=build_error_response(error_msg), status_code=502)
             except Exception as exc:
-                error_msg = str(exc)
+                error_msg = str(exc) or type(exc).__name__
                 logger.exception("Native Codex 请求处理异常")
                 _audit_event("responses.native_failed", request_id, model=model, error=error_msg)
                 _record_request(
@@ -4891,6 +4916,8 @@ def create_app(verbose: bool = False) -> FastAPI:
                         first_response_ms=native_chat_first_response_ms,
                     )
                 return _bind_stream_principal(response, principal)
+            except NativePoolBusy:
+                return _native_busy_response(start_time, model, "chat", stream, request_id, target_model)
             except ChatToResponsesConversionError as exc:
                 message = str(exc)
                 _audit_event("chat.responses_conversion_error", request_id, model=model, error=message)

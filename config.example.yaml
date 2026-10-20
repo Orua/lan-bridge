@@ -8,6 +8,10 @@ server:
   native_stream_timeout: 600
   # Reuse official native HTTP connections; false restores per-request clients.
   native_connection_pool: true
+  # Shared capacity across replacement pools; overload returns 503 + Retry-After.
+  native_max_active: 32
+  native_max_waiters: 128
+  native_pool_wait_timeout: 10
   # Disabled by default. When enabled, LAN BRIDGE reads the bridge host's
   # file-based Codex login; clients authenticate with a managed bridge key.
   native_auth_injection:

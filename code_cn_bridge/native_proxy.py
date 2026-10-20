@@ -144,6 +144,21 @@ class NativeUpstreamHTTPError(RuntimeError):
         self.status_code = status_code
 
 
+class _NativeStreamingResponse(StreamingResponse):
+    """Close the upstream even if downstream fails before iteration starts."""
+
+    def __init__(self, *args, client, upstream, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._native_client = client
+        self._native_upstream = upstream
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await close_http_client(self._native_client, self._native_upstream)
+
+
 class ResponseContextAccessError(RuntimeError):
     """A continuation cannot access a cache entry owned by this bridge key."""
 
@@ -600,6 +615,9 @@ def _native_client(config, timeout: httpx.Timeout) -> httpx.AsyncClient:
     proxy_url = ""
     if _is_official_openai_url(_native_base_url(config)):
         proxy_url = str(server.get("codex_official_proxy_url") or "").strip()
+    timeout = httpx.Timeout(timeout)
+    pool_wait = float(server.get("native_pool_wait_timeout", 10))
+    timeout.pool = min(timeout.pool if timeout.pool is not None else pool_wait, pool_wait)
     pool = getattr(config, "_native_http_pool", None)
     if pool is not None:
         if server.get("native_connection_pool", True):
@@ -755,6 +773,9 @@ async def proxy_native_responses(
         except Exception as exc:
             failed = True
             stream_error = str(exc)[:_MAX_UPSTREAM_ERROR_DETAIL] or type(exc).__name__
+            invalidate = getattr(client, "invalidate", None)
+            if isinstance(exc, httpx.TransportError) and callable(invalidate):
+                invalidate(type(exc).__name__)
             raise
         finally:
             try:
@@ -765,8 +786,10 @@ async def proxy_native_responses(
 
     content_type = upstream.headers.get("content-type", "")
     if "text/event-stream" in content_type or body.get("stream"):
-        return StreamingResponse(
+        return _NativeStreamingResponse(
             stream_bytes(),
+            client=client,
+            upstream=upstream,
             status_code=upstream.status_code,
             headers=headers,
             media_type=None,

@@ -116,6 +116,27 @@ LAN BRIDGE 是基于上游项目
 - Electron desktop manager with dashboard, provider/model configuration, logs, themes, language settings, tray operation, and launch-at-login support.
 - Credentials are read from local YAML or environment variables and are removed from configuration exports.
 
+## Native connection recovery and capacity
+
+Official native requests share a connection pool. A transport failure retires
+the affected client; existing streams drain before it closes, and subsequent
+requests use a fresh client. Connection setup and connection-pool acquisition
+may retry before sending the request. Write, read, and protocol failures are
+reported without replaying the business request.
+
+The default native capacity is 32 active requests and 128 waiting requests,
+shared across replacement clients. Waiting expires after 10 seconds; a full
+or expired queue returns HTTP 503 with `Retry-After: 2`. Ordinary capacity
+pressure does not reset healthy connections. These bounds protect the bridge
+from accumulating requests during an outage; they do not change upstream
+account limits or an Agent server's task concurrency.
+
+Override `server.native_max_active` (1–128), `native_max_waiters` (0–512),
+and `native_pool_wait_timeout` (up to 30 seconds) in the local configuration,
+then restart LAN BRIDGE. `/admin/api/status` includes aggregate `native_pool`
+active, waiting, rejected, and reset counters. History remains client-managed;
+the bridge does not silently clip historical messages or tool results.
+
 ## Security model
 
 This repository contains no production API keys or personal runtime

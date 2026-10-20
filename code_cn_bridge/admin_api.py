@@ -235,6 +235,7 @@ async def get_status():
         "port": cfg.server_port,
         "version": __version__,
         "stats": stats.get_summary(),
+        "native_pool": getattr(cfg, "_native_http_pool", None).snapshot() if getattr(cfg, "_native_http_pool", None) else None,
     }
 
 

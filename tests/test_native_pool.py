@@ -3,15 +3,15 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import anyio
 import httpx
 import pytest
 from starlette.requests import Request
 
-from code_cn_bridge.http_utils import close_http_client, make_native_async_client
-from code_cn_bridge.native_pool import NativeClientPool
+from code_cn_bridge.http_utils import close_http_client, make_native_async_client, send_with_connect_retries
+from code_cn_bridge.native_pool import NativeClientPool, NativePoolBusy
 from code_cn_bridge.native_proxy import _native_client, proxy_native_responses
 
 
@@ -125,6 +125,7 @@ def test_identity_rotation_drains_old_stream_and_releases_cancelled_lease():
             old = a._entry
             b, req_b = lease(pool, upstream.url, "fake-b")
             response_b = await b.send(req_b, stream=True)
+            current_entry = b._entry
             assert old.retired and not old.client.is_closed
             assert a._entry is not b._entry
             assert await response_a.aread()
@@ -134,10 +135,10 @@ def test_identity_rotation_drains_old_stream_and_releases_cancelled_lease():
             assert old.client.is_closed
             assert await response_b.aread()
             await close_http_client(b, response_b)
-            assert not b._entry.client.is_closed
+            assert not current_entry.client.is_closed
             assert [h["authorization"] for h in upstream.requests] == ["fake-a", "fake-b"]
             await pool.close()
-            assert b._entry.client.is_closed
+            assert current_entry.client.is_closed
     asyncio.run(run())
 
 
@@ -199,9 +200,10 @@ def test_proxy_hot_change_and_disable_retire_without_cutting_active_request():
         direct = _native_client(cfg, httpx.Timeout(10))
         assert isinstance(direct, httpx.AsyncClient)
         await direct.aclose()
+        old_entry, new_entry = old._entry, new._entry
         await old.aclose()
         await new.aclose()
-        assert old._entry.client.is_closed and new._entry.client.is_closed
+        assert old_entry.client.is_closed and new_entry.client.is_closed
         await pool.close()
     asyncio.run(run())
 
@@ -221,4 +223,286 @@ def test_disconnect_does_not_close_other_stream_or_replay_request():
             await close_http_client(b, response_b)
             assert len(upstream.requests) == 2
             await pool.close()
+    asyncio.run(run())
+
+
+class BrokenTLSProxy(SocketUpstream):
+    async def handle(self, reader, writer):
+        self.accepts += 1
+        self.writers.add(writer)
+        task = asyncio.current_task()
+        self.tasks.add(task)
+        try:
+            self.requests.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            await writer.drain()
+            while await reader.read(65536):
+                pass
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+            self.writers.discard(writer)
+            self.tasks.discard(task)
+
+
+def test_repeated_proxy_tls_failures_retire_slots_and_next_request_recovers():
+    async def run():
+        async with BrokenTLSProxy() as proxy:
+            pool = NativeClientPool()
+            recovered = False
+
+            def factory(**kwargs):
+                if recovered:
+                    kwargs["proxy_url"] = ""
+                    kwargs["transport"] = httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True}))
+                return make_native_async_client(**kwargs)
+
+            try:
+                with patch("code_cn_bridge.native_pool.make_native_async_client", side_effect=factory):
+                    for _ in range(22):
+                        client = pool.lease(("https", "chatgpt.com", 443), proxy.url, httpx.Timeout(0.2, connect=0.03, pool=0.05))
+                        req = client.build_request("GET", "https://chatgpt.com/test", headers={"authorization": "fake"})
+                        entry = client._entry
+                        with pytest.raises(httpx.ConnectTimeout):
+                            await client.send(req)
+                        await client.aclose()
+                        assert entry.client.is_closed
+                        assert not pool._entries
+                        assert pool.snapshot()["active"] == pool.snapshot()["reserved"] == 0
+                    assert proxy.accepts == 22
+                    recovered = True
+                    for _ in range(2):
+                        client = pool.lease(("https", "chatgpt.com", 443), proxy.url, httpx.Timeout(0.2, connect=0.03, pool=0.05))
+                        response = await client.get("https://chatgpt.com/test", headers={"authorization": "fake"})
+                        assert response.json() == {"ok": True}
+                        await client.aclose()
+                    assert pool.snapshot()["resets"] == 22
+                    assert len(pool._entries) == 1
+            finally:
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_connect_retry_uses_fresh_pool_and_preserves_request_bytes():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool()
+            client, req = lease(pool, upstream.url)
+            entry = client._entry
+            calls = AsyncMock(side_effect=httpx.ConnectError("fixture"))
+            try:
+                with patch.object(entry.client, "send", calls):
+                    response = await send_with_connect_retries(client, req)
+                assert response.status_code == 200
+                assert calls.await_count == 1
+                assert len(upstream.requests) == 1
+                assert entry.retired and entry.client.is_closed
+                assert pool.snapshot()["resets"] == 1
+            finally:
+                await client.aclose()
+                await pool.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("error", [httpx.WriteError, httpx.ReadError, httpx.RemoteProtocolError])
+def test_post_write_failures_retire_for_future_requests_without_replay(error):
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool()
+            client, req = lease(pool, upstream.url)
+            entry = client._entry
+            calls = AsyncMock(side_effect=error("fixture"))
+            try:
+                with patch.object(entry.client, "send", calls), pytest.raises(error):
+                    await send_with_connect_retries(client, req)
+                assert calls.await_count == 1
+                await client.aclose()
+                assert entry.client.is_closed
+                following, next_req = lease(pool, upstream.url)
+                try:
+                    response = await following.send(next_req)
+                    assert response.status_code == 200
+                    assert len(upstream.requests) == 1
+                finally:
+                    await following.aclose()
+            finally:
+                await client.aclose()
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_pool_timeout_resets_once_before_business_request_is_sent():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool()
+            client, req = lease(pool, upstream.url)
+            entry = client._entry
+            try:
+                with patch.object(entry.client, "send", AsyncMock(side_effect=httpx.PoolTimeout("fixture"))):
+                    response = await client.send(req)
+                assert response.status_code == 200
+                assert pool.snapshot()["resets"] == 1
+                assert entry.client.is_closed
+                assert len(upstream.requests) == 1
+            finally:
+                await client.aclose()
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_failed_pool_does_not_interrupt_other_active_stream():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool()
+            healthy, good_req = lease(pool, upstream.url)
+            response = await healthy.send(good_req, stream=True)
+            entry = healthy._entry
+            failing, bad_req = lease(pool, upstream.url)
+            try:
+                with patch.object(entry.client, "send", AsyncMock(side_effect=httpx.ConnectError("fixture"))), pytest.raises(httpx.ConnectError):
+                    await failing.send(bad_req)
+                await failing.aclose()
+                assert entry.retired and not entry.client.is_closed
+                assert b"response.completed" in await response.aread()
+                await close_http_client(healthy, response)
+                assert entry.client.is_closed
+                assert pool.snapshot()["active"] == 0
+            finally:
+                await failing.aclose()
+                await close_http_client(healthy, response)
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_capacity_wait_is_bounded_and_does_not_reset_healthy_pool():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool(max_active=1, max_waiters=1, wait_timeout=0.03)
+            active, req = lease(pool, upstream.url)
+            response = await active.send(req, stream=True)
+            waiting, queued_req = lease(pool, upstream.url)
+            try:
+                with pytest.raises(NativePoolBusy):
+                    await waiting.send(queued_req)
+                assert pool.snapshot()["resets"] == 0
+                assert pool.snapshot()["active"] == 1
+                assert pool.snapshot()["waiting"] == 0
+                assert not active._entry.client.is_closed
+                rejected = pool.lease(("http", "127.0.0.1", 1), "", httpx.Timeout(600))
+                with pytest.raises(NativePoolBusy):
+                    rejected.build_request("GET", upstream.url)
+                await rejected.aclose()
+                assert req.extensions["timeout"]["pool"] == 0.03
+            finally:
+                await waiting.aclose()
+                await close_http_client(active, response)
+                await pool.close()
+            assert pool.snapshot()["reserved"] == pool.snapshot()["active"] == 0
+    asyncio.run(run())
+
+
+def test_cancelling_queued_request_restores_capacity_without_pool_reset():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool(max_active=1, max_waiters=1, wait_timeout=1)
+            active, req = lease(pool, upstream.url)
+            response = await active.send(req, stream=True)
+            queued, next_req = lease(pool, upstream.url)
+            task = asyncio.create_task(queued.send(next_req))
+            await asyncio.sleep(0)
+            assert pool.snapshot()["waiting"] == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await queued.aclose()
+            assert pool.snapshot()["waiting"] == 0 and pool.snapshot()["resets"] == 0
+            await close_http_client(active, response)
+            await pool.close()
+            assert pool.snapshot()["reserved"] == 0
+    asyncio.run(run())
+
+
+def test_hundred_simultaneous_requests_have_bounded_active_and_waiting_counts():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool(max_active=4, max_waiters=8, wait_timeout=1)
+            peaks = {"active": 0, "waiting": 0, "reserved": 0}
+            async def turn():
+                client = pool.lease(("http", "127.0.0.1", httpx.URL(upstream.url).port), "", httpx.Timeout(10))
+                try:
+                    req = client.build_request("POST", upstream.url, headers={"authorization": "fake"}, json={})
+                    task = asyncio.create_task(client.send(req, stream=True))
+                    await asyncio.sleep(0)
+                    for name in peaks:
+                        peaks[name] = max(peaks[name], pool.snapshot()[name])
+                    response = await task
+                    try:
+                        assert b"response.completed" in await response.aread()
+                    finally:
+                        await response.aclose()
+                    return "ok"
+                except NativePoolBusy:
+                    return "busy"
+                finally:
+                    await client.aclose()
+            try:
+                results = await asyncio.gather(*(turn() for _ in range(100)))
+                assert results.count("ok") == 12 and results.count("busy") == 88
+                assert peaks["active"] <= 4 and peaks["waiting"] <= 8 and peaks["reserved"] <= 12
+                assert pool.snapshot()["active"] == pool.snapshot()["waiting"] == pool.snapshot()["reserved"] == 0
+                assert pool.snapshot()["resets"] == 0
+            finally:
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_cancelling_tls_handshake_retires_broken_slot_and_releases_capacity():
+    async def run():
+        async with BrokenTLSProxy() as proxy:
+            pool = NativeClientPool(max_active=1, max_waiters=1)
+            client = pool.lease(("https", "fixture.invalid", 443), proxy.url, httpx.Timeout(30))
+            req = client.build_request("GET", "https://fixture.invalid/responses")
+            entry = client._entry
+            task = asyncio.create_task(client.send(req))
+            try:
+                for _ in range(100):
+                    if proxy.requests:
+                        break
+                    await asyncio.sleep(0.01)
+                assert proxy.requests, "CONNECT was not reached"
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                await client.aclose()
+                assert entry.retired and entry.client.is_closed
+                assert pool.snapshot()["active"] == pool.snapshot()["reserved"] == 0
+                assert pool.snapshot()["resets"] == 1
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                await client.aclose()
+                await pool.close()
+    asyncio.run(run())
+
+
+def test_downstream_failure_before_stream_iteration_releases_native_lease():
+    async def run():
+        async with SocketUpstream() as upstream:
+            pool = NativeClientPool()
+            cfg = SimpleNamespace(data={"server": {}}, _native_http_pool=pool)
+            scope = {"type": "http", "method": "POST", "path": "/v1/responses", "headers": [], "query_string": b"", "asgi": {"spec_version": "2.4"}}
+            with patch("code_cn_bridge.native_proxy._native_base_url", return_value=upstream.url), patch("code_cn_bridge.native_proxy.native_request_headers", return_value={"authorization": "fake"}):
+                response = await proxy_native_responses(Request(scope), {"input": [], "stream": True}, "fixture", cfg)
+            async def receive():
+                return {"type": "http.disconnect"}
+            async def send(message):
+                raise RuntimeError("fixture downstream rejected headers")
+            try:
+                with pytest.raises(RuntimeError):
+                    await response(scope, receive, send)
+                assert pool.snapshot()["active"] == pool.snapshot()["reserved"] == 0
+                assert response._native_upstream.is_closed
+            finally:
+                await pool.close()
     asyncio.run(run())

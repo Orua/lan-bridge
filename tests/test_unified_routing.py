@@ -36,6 +36,7 @@ from code_cn_bridge.provider_proxy import (
 from code_cn_bridge.routing import resolve_route
 from code_cn_bridge.codex_auth import NativeCredentials
 from code_cn_bridge.access_control import ANONYMOUS_PRINCIPAL
+from code_cn_bridge.native_pool import NativePoolBusy
 from code_cn_bridge import server
 
 
@@ -1476,6 +1477,37 @@ class UnifiedRoutingTests(unittest.TestCase):
         compact_request = upstream_client.chat_completion.await_args.args[0]
         self.assertFalse(compact_request["stream"])
         self.assertEqual(compact_request.get("tools", []), [])
+
+    def test_native_capacity_returns_retryable_503_on_all_native_endpoints(self):
+        cases = [
+            ("/v1/responses", {"input": [], "stream": True}),
+            ("/v1/responses/compact", {"input": []}),
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hello"}], "stream": True}),
+        ]
+        for path, body in cases:
+            with (
+                self.subTest(path=path),
+                patch.object(server, "get_config", return_value=FakeConfig()),
+                patch.object(server, "proxy_native_responses", new=AsyncMock(side_effect=NativePoolBusy())),
+                patch.object(server, "proxy_chat_to_native_responses", new=AsyncMock(side_effect=NativePoolBusy())),
+                patch.object(server, "_audit_event") as audit,
+            ):
+                response = TestClient(server.create_app()).post(path, json={"model": "gpt-5.6-sol", **body})
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.headers["retry-after"], "2")
+            self.assertIn("native_upstream_busy", json.dumps(response.json()))
+            self.assertTrue(any(call.args[0] == "native.capacity_rejected" for call in audit.call_args_list))
+
+    def test_native_transport_failure_records_type_without_traceback(self):
+        with (
+            patch.object(server, "get_config", return_value=FakeConfig()),
+            patch.object(server, "proxy_native_responses", new=AsyncMock(side_effect=httpx.ConnectTimeout(""))),
+            patch.object(server.logger, "exception") as traceback_log,
+        ):
+            response = TestClient(server.create_app()).post("/v1/responses", json={"model": "gpt-5.6-sol", "input": []})
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("ConnectTimeout", response.json()["error"]["message"])
+        traceback_log.assert_not_called()
 
     def test_native_endpoint_records_upstream_400_with_response_summary(self):
         cfg = FakeConfig()
