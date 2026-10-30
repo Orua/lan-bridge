@@ -3,7 +3,7 @@ productName: LAN BRIDGE
 copyright: MIT
 
 directories:
-  output: ../../../lan_bridge_release
+  output: ../agent/output/windows
   buildResources: assets
 
 beforePack: scripts/verify-backend.cjs
@@ -20,19 +20,6 @@ extraResources:
     to: assets/
   - from: recovery/
     to: recovery/
-
-mac:
-  target:
-    - dmg
-  icon: assets/icon.icns
-
-linux:
-  target:
-    - AppImage
-    - deb
-  icon: assets/icon.png
-  category: Utility
-  maintainer: Orua
 
 nsis:
   oneClick: false

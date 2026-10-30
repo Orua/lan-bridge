@@ -1,435 +1,70 @@
 # LAN BRIDGE
 
-![LAN BRIDGE logo](desktop/assets/icon.png)
+![LAN BRIDGE](desktop/assets/icon.png)
 
-LAN BRIDGE turns one computer into an OpenAI-compatible bridge for trusted
-clients on the same local network. Clients use one LAN address and a stable set
-of model aliases; the bridge selects the configured upstream provider,
-translates protocols and tool calls when required, forwards the request with
-the provider credential stored on the bridge host, and streams the normalized
-response back to the client.
+把一台电脑上的模型服务接入，提供给自己的可信局域网设备使用。
+支持 Codex 原生 Responses、自定义 OpenAI 兼容上游、模型路由、流式输出、访问密匙与用量统计。
 
-## What LAN BRIDGE does
+**日常使用统一安装 Windows 桌面版。桌面程序自带 Python 后端；不需要再安装一个“命令行版”。**
 
-Run LAN BRIDGE on a computer that can reach your upstream model services, then
-point Codex CLI, Codex Desktop, VS Code extensions, or another OpenAI-compatible
-client at that computer. Multiple trusted devices on the LAN can share the same
-bridge endpoint and routing configuration without copying every provider key to
-every client.
+## 安装、设置、启动
 
-```text
-Codex / VS Code / other OpenAI-compatible clients
-                         │
-                         │  LAN: http://<bridge-ip>:8765/v1
-                         ▼
-                    LAN BRIDGE
-       model alias → provider routing → protocol/tool/stream conversion
-                         │
-                         ▼
-       Qwen / DeepSeek / Kimi / GLM / Doubao / OpenAI-compatible APIs
-```
+1. 打开 [最新发布下载页](https://github.com/Orua/lan-bridge/releases/latest)。
+2. Windows 10/11 x64 下载 **`LAN BRIDGE Setup <版本>.exe`**，完成安装。
+3. 从桌面或开始菜单打开 **LAN BRIDGE**。它会显示独立窗口并自动启动后端。
+4. 要使用自己的 ChatGPT/Codex 登录，在桥接电脑完成 Codex 文件登录，再到桌面 **设置 → 主机 Codex 登录注入** 启用并保存。
+5. 在 **访问密匙** 创建一个 Bridge 密匙；客户端使用这个密匙和 `http://127.0.0.1:8765/v1`。
+6. 其他设备访问时，在设置把监听地址改为局域网接口或 `0.0.0.0`，保存并重启代理，再把客户端地址改为 `http://<桥接电脑IP>:8765/v1`。
 
-The bridge accepts OpenAI-style Responses, Chat Completions, model-list, and
-image-generation requests. Depending on the selected model route, it either
-passes a native Responses request to a compatible upstream or converts it to a
-provider-compatible Chat Completions flow, then converts the result back into
-the response shape expected by the client. Streaming, tool calls, conversation
-continuations, vision, image generation, and optional Web Search are handled by
-the same routing layer.
+**首次配置请按 [Windows 安装、登录与使用指南](docs/WINDOWS.md) 操作。**
+指南包含 Codex 登录命令、API 上游设置、客户端配置、托盘操作和故障处理。
 
-## 软件作用
-
-LAN BRIDGE 用一台能够访问上游模型服务的电脑，在可信局域网内建立统一的 OpenAI 兼容
-桥接入口。Codex CLI、Codex Desktop、VS Code 插件以及其他 OpenAI 兼容客户端只需连接
-这台电脑的局域网地址，并使用统一的模型别名；桥接器会选择对应的上游提供商，按需转换
-Responses 与 Chat Completions 协议、工具调用和流式事件，使用保存在桥接主机上的提供商
-凭据转发请求，再把规范化后的结果流式返回客户端。
-
-这样，多台可信设备可以共用一个局域网入口、一套模型路由和上游配置，不需要在每台客户
-端分别保存全部提供商密钥。它同时处理连续会话、工具调用、视觉输入、图片生成及可选的
-Web Search；对于支持原生 Responses API 的上游可直接转发，对于只支持 Chat
-Completions 的上游则执行双向协议转换。
-
-> [!IMPORTANT]
-> LAN BRIDGE is an independently maintained derivative of
-> [git-liu835/codex-cn-bridge](https://github.com/git-liu835/codex-cn-bridge),
-> formerly named `code CN Bridge`. It is not an official upstream release and
-> is not maintained or supported by the upstream author. This repository was
-> created from a substantially modified working tree with a new, squashed Git
-> history, so GitHub does not display it as a platform-level fork. See
-> [NOTICE.md](NOTICE.md) for attribution and provenance details.
-
-## Differences from upstream
-
-The exact upstream base commit was not preserved when this public repository
-was created. The comparison below describes the material differences verified
-against upstream `git-liu835/codex-cn-bridge` v0.3.22 and this repository's
-initial public release.
-
-| Area | LAN BRIDGE changes |
+| 看到的文件/命令 | 用途 |
 | --- | --- |
-| Identity and local state | Renamed the public product, CLI command, application identifiers, executable, configuration file, environment-variable prefix, user-data directory, and UI links from `code CN Bridge` to `LAN BRIDGE`. |
-| Responses compatibility | Extends Responses API translation, continuation handling, tool-call normalization, streaming recovery, WebSocket handling, image/vision flows, Web Search rounds, context compaction, and usage reporting for Codex-style clients. |
-| Routing | Adds strict per-model provider routing, separate native Responses and Chat-compatible paths, custom provider slots, fallback controls, proxy support, and configurable context limits. |
-| Providers and desktop controls | Adds an OpenAI-compatible adapter and expanded dashboard controls for model capabilities, native/custom routing, search, configuration import/export, and diagnostics. |
-| Security and privacy | Uses a redacted example configuration, keeps live credentials outside Git, removes secrets from configuration exports, avoids shipping company-specific paths and test data, and defaults to loopback-only binding. |
-| Reliability and tests | Adds connection reuse, bounded logging and statistics, lifecycle recovery, packaged-backend verification, CI, and a substantially expanded Python/Electron regression suite. |
-| Packaging scope | Focuses the maintained release flow on Windows installer/portable builds with one unified application/tray icon. Upstream auto-update and macOS/Linux release paths are not carried as supported LAN BRIDGE release flows. |
+| `LAN BRIDGE Setup <版本>.exe` | 推荐安装包，包含完整桌面与后端 |
+| `LAN BRIDGE <版本>.exe` | 同一个桌面程序的便携包，二选一即可 |
+| `resources/backend/lan-bridge.exe` | 桌面内部组件，不要单独运行或分发 |
+| `pip install -e .` / `lan-bridge start` | 后端开发入口，没有桌面 UI |
+| `npm run dev` | Electron 桌面开发，要求先准备 Python 环境 |
+| `npm run ui:dev` / 端口 `5173` | 仅前端调试服务，不能作为已安装的桌面版交付 |
 
-These changes make the projects behaviorally different. Upstream issues and
-support requests should be reproduced against upstream before being reported
-there; LAN BRIDGE-specific issues belong in this repository.
+Chrome 里打开一个开发网页不等于安装成功。ChatGPT 网页 Cookie、Codex 主机登录缓存和 Bridge 密匙是三种不同状态；LAN BRIDGE 不靠管理页面的浏览器登录工作。
 
-## 中文说明：与上游版本的关系和差异
+## 从 Git 仓库安装
 
-LAN BRIDGE 是基于上游项目
-[git-liu835/codex-cn-bridge](https://github.com/git-liu835/codex-cn-bridge)
-修改形成的独立维护版本，上游项目原名为 `code CN Bridge`。本项目不是上游官方发布版，
-上游作者不负责 LAN BRIDGE 的修改内容、构建产物、技术支持或安全决策。
-
-本公开仓库是从经过大量修改的本地工作区重新建立，并使用了压缩后的全新 Git 历史，
-因此 GitHub 页面不会自动显示“Forked from”标记。新历史没有保留当时所基于的精确上游
-提交号；以下内容是以当前可核验的上游 v0.3.22 与 LAN BRIDGE 首个公开版本为参照整理的
-主要差异。
-
-| 对比范围 | LAN BRIDGE 相对上游的主要变化 |
-| --- | --- |
-| 品牌与本地状态 | 将公开产品名、CLI 命令、应用标识、可执行文件、配置文件、环境变量前缀、用户数据目录和界面链接由 `code CN Bridge` 统一调整为 `LAN BRIDGE`。 |
-| Responses 兼容性 | 扩展 Responses API 转换、连续会话、工具调用规范化、流式恢复、WebSocket、图片与视觉流程、Web Search 多轮调用、上下文压缩及 Codex 客户端用量统计。 |
-| 路由机制 | 增加严格的逐模型提供商路由，将原生 Responses 与 Chat 兼容路径分开，加入自定义提供商槽位、回退控制、代理支持和可配置上下文上限。 |
-| 提供商与桌面控制 | 增加 OpenAI 兼容适配器，并扩展模型能力、原生/自定义路由、搜索、配置导入导出和诊断等桌面管理功能。 |
-| 安全与隐私 | 使用脱敏示例配置，将真实凭据保留在 Git 之外；配置导出会移除敏感信息，同时排除公司内部路径、专用测试数据，并默认只监听本机回环地址。 |
-| 稳定性与测试 | 增加连接复用、有容量上限的日志与统计、生命周期恢复、打包后端校验、CI，以及更完整的 Python/Electron 回归测试。 |
-| 发布范围 | 当前维护重点是 Windows 安装版和便携版，并统一应用与托盘图标；上游的自动更新及 macOS/Linux 发布流程不属于 LAN BRIDGE 当前支持的发布范围。 |
-
-两个项目现在的行为和发布方式已经明显不同。只有能在上游原版中复现的问题才适合提交给
-上游；LAN BRIDGE 特有的问题应在本仓库反馈。更完整的来源与署名信息见
-[NOTICE.md](NOTICE.md)。
-
-## Features
-
-- OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and image-generation endpoints.
-- Model aliases and provider routing for Qwen, DeepSeek, Kimi, GLM, Doubao, OpenAI-compatible services, and custom slots.
-- Streaming translation, tool-call handling, usage statistics, request logs, and configuration hot reload.
-- Optional native Codex routing, host-side Codex login injection for the same user on a trusted LAN, Web Search integration, and model context-window controls.
-- Managed bridge access keys with per-key model allowlists and lightweight token-usage accounting.
-- Electron desktop manager with dashboard, provider/model configuration, logs, themes, language settings, tray operation, and launch-at-login support.
-- Credentials are read from local YAML or environment variables and are removed from configuration exports.
-
-## Native connection recovery and capacity
-
-Official native requests share a connection pool. A transport failure retires
-the affected client; existing streams drain before it closes, and subsequent
-requests use a fresh client. Connection setup and connection-pool acquisition
-may retry before sending the request. Write, read, and protocol failures are
-reported without replaying the business request.
-
-The default native capacity is 32 active requests and 128 waiting requests,
-shared across replacement clients. Waiting expires after 10 seconds; a full
-or expired queue returns HTTP 503 with `Retry-After: 2`. Ordinary capacity
-pressure does not reset healthy connections. These bounds protect the bridge
-from accumulating requests during an outage; they do not change upstream
-account limits or an Agent server's task concurrency.
-
-Override `server.native_max_active` (1–128), `native_max_waiters` (0–512),
-and `native_pool_wait_timeout` (up to 30 seconds) in the local configuration,
-then restart LAN BRIDGE. `/admin/api/status` includes aggregate `native_pool`
-active, waiting, rejected, and reset counters. History remains client-managed;
-the bridge does not silently clip historical messages or tool results.
-
-## Security model
-
-This repository contains no production API keys or personal runtime
-configuration. Do not commit `.lan-bridge.yaml`, `.lan-bridge.env`, `.env`,
-logs, captures, or exported credentials.
-
-The server defaults to `127.0.0.1`, which is reachable only from the bridge
-host. LAN access requires explicitly binding to `0.0.0.0` or to a LAN interface
-address. The management API remains loopback-only. When `access_control.enabled`
-is true, every `/v1/*` HTTP or WebSocket request must carry a bridge-issued
-bearer key. A key may allow every model (`*`, including internal Codex helper
-models such as auto-review) or use an explicit model allowlist. Key
-verifiers are stored as hashes in a separate local access-key store (not in
-exportable YAML); the raw value is displayed only once at creation or rotation.
-Keep the bridge on a trusted LAN or VPN, restrict the port with the host
-firewall, and never publish it directly to the Internet. Plain HTTP protects
-neither prompts nor keys from a hostile LAN; use an isolated network, SSH
-tunnel, or TLS where appropriate.
-
-## Requirements
-
-- Python 3.10+
-- Node.js 18+ and npm (desktop development and packaging only)
-- Windows 10/11 for the packaged desktop application
-
-## Quick start: backend
+普通用户直接用上面的安装包。已经拉取源码、需要自行构建时，在仓库根目录执行：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-pip install -e .
-lan-bridge init --provider qwen
-$env:QWEN_API_KEY = "your-key"
-lan-bridge start
+# 先安装 Python 3.10+ 和 Node.js 22.12+（含 npm），然后打开新的 PowerShell。
+powershell -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Build
+powershell -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Start
 ```
 
-The default endpoint is `http://127.0.0.1:8765/v1`. The default configuration file is `%USERPROFILE%\.lan-bridge.yaml`. You can start from [config.example.yaml](config.example.yaml) and set credentials through environment variables instead of writing keys into YAML.
+`Build` 自动创建本项目的 `.venv`、安装依赖、执行测试、打包后端与 Electron，并检查版本、CSP 和 SHA-256。
+安装包在 **`agent/output/windows/`**。`Start` 打开其中的完整桌面程序；首次构建需要联网下载依赖。
+完整开发命令与发布约束见 [开发与发布指南](docs/DEVELOPMENT.md)。
 
-### Enable trusted LAN access / 开启可信局域网访问
+## 安全与数据位置
 
-The default `127.0.0.1` binding is local-only. To let other trusted devices on
-the same LAN use the bridge, set the listening host in `.lan-bridge.yaml`:
+- 默认只监听本机 `127.0.0.1:8765`；管理 API 只允许本机访问。
+- `/v1/*` 默认需要有效 Bridge 密匙。不要用 `any-value` 或上游 ChatGPT 登录令牌替代。
+- 上游凭据和 Codex 登录留在桥接主机，客户端只保存 Bridge 密匙。
+- 配置通常是 `%USERPROFILE%\.lan-bridge.yaml`；以桌面设置页显示的实际路径为准。
+- 只在自己的可信 LAN/VPN 使用；防火墙只放行必要设备，不要直接暴露到公网。
+- 不要提交真实 YAML、`.env`、`auth.json`、访问密匙或日志。导出的脱敏配置不包含可迁移的登录凭据。
 
-默认的 `127.0.0.1` 只能由桥接主机本机访问。要让同一局域网中的其他可信设备使用，
-请在 `.lan-bridge.yaml` 中修改监听地址：
+## 版本与来源
 
-```yaml
-server:
-  host: 0.0.0.0
-  port: 8765
-```
+`VERSION` 是唯一发布版本来源。桌面、后端、CLI 与“关于”页必须保持一致。
+目前维护 Windows x64 桌面发布，不提供独立网页产品或独立 CLI 安装包。
+Python 后端属于同一产品的必要组件，保留其代码和开发命令。
 
-Restart LAN BRIDGE after changing the listening address. On another device,
-replace `<bridge-ip>` with the bridge computer's LAN IP, for example:
-
-修改监听地址后需要重启 LAN BRIDGE。其他设备应把 `<bridge-ip>` 替换为桥接主机的
-局域网 IP，例如：
-
-```text
-Base URL: http://192.168.1.20:8765/v1
-```
-
-Allow TCP port `8765` only from the trusted LAN or selected client addresses in
-the host firewall. A narrower alternative is to bind directly to the bridge
-computer's LAN IP instead of `0.0.0.0`.
-
-请在主机防火墙中只允许可信局域网或指定客户端访问 TCP `8765` 端口。相比
-`0.0.0.0`，也可以直接绑定桥接主机的局域网 IP，以缩小监听范围。
-
-## Desktop development
-
-```powershell
-cd desktop
-npm ci
-npm run typecheck
-npm run test:electron
-npm run electron:dev
-```
-
-## Build a Windows release
-
-```powershell
-.\scripts\build-backend.ps1
-cd desktop
-npm ci
-npm run electron:build
-```
-
-The backend is written to `dist-backend/`. Electron Builder produces the installer, portable package, and unpacked application in the configured `lan_bridge_release` directory. All application surfaces use the same logo master from `desktop/assets/logo-master.png`.
-
-## Configure Codex or another OpenAI-compatible client
-
-Clients do not copy the bridge host's OpenAI login state or provider API keys.
-They send one LAN BRIDGE access key, while the bridge chooses the upstream route
-from the requested model name and keeps provider credentials on the bridge host.
-Use these values after LAN BRIDGE is running:
-
-```text
-Base URL: http://127.0.0.1:8765/v1
-API key: a LAN BRIDGE access key created in the desktop Access Keys page
-Model: a configured custom alias or any native model ID available to the host account
-```
-
-For a client on another trusted LAN device, use
-`http://<bridge-ip>:8765/v1` instead. Access control defaults to fail closed:
-until the loopback-only desktop manager creates the first key, `/v1/*` returns
-a configuration error rather than accepting unauthenticated traffic.
-
-The desktop Settings page can update the local YAML, import/export redacted configuration, and switch Codex between LAN BRIDGE and official OpenAI routing.
-
-### WorkBuddy Chat-to-Responses compatibility
-
-WorkBuddy can keep using its normal OpenAI-compatible Chat Completions setting:
-
-```text
-Base URL: http://<bridge-host>:8765/v1
-Model: gpt-5.6-terra-wb-responses
-API key: a LAN BRIDGE access key
-useCustomProtocol: false
-```
-
-Create the alias in the desktop **Models** page, or add an equivalent mapping
-to `config.yaml`:
-
-```yaml
-model_mapping:
-  gpt-5.6-terra-wb-responses:
-    target: gpt-5.6-terra
-    upstream_model: gpt-5.6-terra
-    provider: openai-compatible
-    inbound_protocol: chat_completions
-    upstream_protocol: responses
-    wire_api: responses
-    enabled: true
-    capabilities:
-      reasoning: true
-      image_input: true
-      parallel_tool_calls: true
-```
-
-The alias is deliberately explicit: the bridge converts Chat `messages` to
-Responses `input`, calls `/v1/responses`, and converts the JSON or SSE result
-back to the Chat Completions shape expected by WorkBuddy. Existing aliases
-without this exact inbound/upstream pairing keep their current Chat or native
-Responses behavior. Unsupported Chat-only parameters are removed according to
-the model capability settings and recorded only as debug-level field names.
-
-### Official Codex custom provider
-
-Codex can use the bridge as a custom Responses provider. The following is a
-minimal example; keep the access key in the environment rather than in a
-committed config file:
-
-```toml
-model_provider = "lan_bridge"
-
-[model_providers.lan_bridge]
-name = "LAN BRIDGE"
-base_url = "http://192.168.1.20:8765/v1"
-wire_api = "responses"
-env_key = "LAN_BRIDGE_API_KEY"
-requires_openai_auth = false
-```
-
-Set `LAN_BRIDGE_API_KEY` on the client to the key issued by LAN BRIDGE. Any
-valid key can send a new native Codex model ID, such as `gpt-6-astra`, directly
-as `model` without adding a model mapping. Existing keys also allow all model
-IDs, even if they were issued when the manager exposed model selection.
-Explicit custom provider aliases still use their configured adapters.
-`/v1/models` returns both the native Codex `models` catalog and OpenAI-compatible
-`object: list` / `data` entries. The bridge does not forward a client OpenAI
-login state.
-
-### Host Codex login injection (same-user trusted LAN)
-
-This optional mode lets a second computer call official Codex Responses models
-without copying the bridge computer's OpenAI login cache. It is intended only
-for one person's trusted devices. It is not an account-sharing, multi-user, or
-public gateway feature, and it does not turn a ChatGPT subscription into an API
-key.
-
-On the bridge computer:
-
-1. Sign in to Codex with ChatGPT and use file-based credential storage
-   (`cli_auth_credentials_store = "file"`). LAN BRIDGE auto-detects
-   `%CODEX_HOME%\auth.json` or `%USERPROFILE%\.codex\auth.json`.
-2. Create an access key in **Access Keys**. Keep the default unrestricted mode
-   when Codex helper models such as auto-review must pass through, or select an
-   explicit model allowlist for a restricted client. Then enable **Host Codex
-   Login Injection**.
-3. Bind only to the required LAN interface and firewall the port to the selected
-   client computer.
-
-On the client computer, keep the OpenAI login out of the configuration and use
-the bridge access key as the custom provider key:
-
-```toml
-model_provider = "lan_bridge"
-
-[model_providers.lan_bridge]
-name = "LAN BRIDGE"
-base_url = "http://192.168.1.20:8765/v1"
-env_key = "LAN_BRIDGE_API_KEY"
-wire_api = "responses"
-requires_openai_auth = false
-```
-
-Set `LAN_BRIDGE_API_KEY` locally to the bridge-only key. LAN BRIDGE validates it,
-removes it before forwarding, then loads `access_token` and `account_id` from
-the bridge host's Codex cache. Client-supplied OpenAI auth and account headers
-are never used as the bridge credential. LAN BRIDGE does not implement its own
-OAuth refresh endpoint; Codex refreshes its cache during normal use. If the
-cached access token expires, use Codex on the bridge computer or sign in again.
-
-### Live account model catalog and timing
-
-The model library and authenticated `GET /v1/models` query the host's ChatGPT
-account catalog. The bridge uses the host Codex client version, so an older
-downstream client cannot hide newer models. Both the rich Codex `models` array
-and the OpenAI-compatible `data` array are returned. A successful inference turn
-verifies access; a catalog entry alone is not an entitlement check. If the
-account catalog is unavailable, the model library labels its configured fallback.
-
-The `first_response_ms` log field measures receipt of the first upstream stream
-bytes locally; it does not depend on official timing headers and is not a
-first-visible-token measurement. A client cancellation is logged as 499;
-upstream failure events, transport failures, or a stream without a terminal
-event are logged as 502. Original native SSE bytes are forwarded unchanged.
-
-### Client-owned conversation history
-
-LAN BRIDGE does not automatically truncate historical tool results or reasoning,
-or deduplicate client instructions and environment messages. This applies to
-Responses-to-Chat translation as well as native/provider Responses routes and
-continuation replay. Clients choose what history to retain or compact. The
-explicit `/v1/responses/compact` endpoint remains available when a client requests
-it; oversized upstream requests are not silently shortened to make them fit.
-
-对话历史由客户端管理。桥接器不再自动裁剪历史工具结果、截短推理或去重客户端指令及
-环境消息；缓存续聊也保留完整内容。客户端主动调用的 `/v1/responses/compact` 仍可使用，
-超过上游限制时保留错误语义，不通过静默删减历史来规避限制。
-
-### Access keys and usage
-
-The desktop **Access Keys** page creates, disables, rotates, and deletes bridge
-keys. Valid enabled keys can request any model ID; upstream account or provider
-access determines availability. The raw key is shown exactly once after creation or rotation, so copy
-it to the client environment immediately. The bridge records a small local
-summary of request count and input/output/total tokens per key; it does not
-store prompts or upstream login tokens in that summary.
-
-## Windows recovery and upstream connection retries
-
-Packaged Windows builds install a per-user `LAN BRIDGE Recovery-<SID>` scheduled
-task on launch. Task Scheduler runs the watcher outside the desktop process
-tree, checking every five seconds and recovering unexpected whole-app exits.
-The desktop still supervises its backend. Recovery launches stay in the tray.
-Choosing **Stop** or **Quit** pauses recovery; starting the app/proxy enables it
-again. The task has no login trigger, so the existing launch-at-login preference
-continues to control startup after a new login.
-
-Recovery state and rotated logs are stored under
-`%LOCALAPPDATA%\lan-bridge\recovery\`. The watcher validates the desktop
-executable path, avoids duplicate starts, and allows 30 seconds for a replacement
-desktop to start. Task Scheduler restarts a failed watcher after one minute.
-
-Upstream connection setup failures (`ConnectTimeout`/`ConnectError`) are retried
-at most twice, after 0.5s and 1s. Read/write failures, HTTP error responses, and
-streams that have already started are never replayed. A cancellation interrupts
-the retry wait immediately. A persistent native connection outage can therefore
-take about 46.5 seconds to exhaust its three 15-second connection attempts.
-
-## Tests
-
-```powershell
-pytest -q
-cd desktop
-npm ci
-npm run typecheck
-npm run test:electron
-```
-
-## Project layout
-
-- `code_cn_bridge/` — Python gateway, protocol translation, adapters, admin API, routing, and statistics.
-- `desktop/` — React + Electron desktop manager and shared logo assets.
-- `tests/` — Python regression tests.
-- `tools/` — diagnostic clients and packaging helpers.
-- `lan-bridge.spec` — reproducible PyInstaller backend definition.
-
-## License
-
-MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md). Upstream attribution is
-retained because substantial portions of this project are derived from
-`git-liu835/codex-cn-bridge`.
+LAN BRIDGE is an independently maintained derivative of
+[git-liu835/codex-cn-bridge](https://github.com/git-liu835/codex-cn-bridge),
+formerly named `code CN Bridge`. It is not an official upstream release and is
+not maintained or supported by the upstream author. This repository was created
+from a substantially modified working tree with a new, squashed Git history;
+the exact original base commit was not preserved. Changes include LAN BRIDGE
+branding, native/custom Responses routing, protocol and streaming conversion,
+host-side Codex credential injection, access keys, and Windows desktop supervision.
+See [NOTICE.md](NOTICE.md) for attribution and provenance. MIT: [LICENSE](LICENSE).

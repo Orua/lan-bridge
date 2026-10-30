@@ -44,7 +44,7 @@ def main():
     help="开启详细日志输出（调试用）",
 )
 def start(config: str | None, port: int | None, host: str | None, verbose: bool):
-    """启动 LAN BRIDGE 代理服务"""
+    """仅启动后端服务（无桌面 UI）；普通安装请使用 Windows 桌面版。"""
     import uvicorn
     import os
 
@@ -114,11 +114,11 @@ def init(provider: str, api_key: str | None, output: str | None):
     click.echo(f"配置文件已生成: {output_path}")
     click.echo()
     click.echo("下一步:")
-    click.echo(f"  1. 设置环境变量: export {provider.upper()}_API_KEY=<你的API Key>")
-    click.echo("  2. 启动代理: lan-bridge start")
-    click.echo("  3. 配置 code CLI:")
-    click.echo('     export OPENAI_BASE_URL="http://localhost:8765/v1"')
-    click.echo('     export OPENAI_API_KEY="any-value"')
+    click.echo("  普通使用：安装并打开 LAN BRIDGE Windows 桌面版（见 README.md）。")
+    click.echo("  本命令只初始化后端配置，不安装桌面 UI，也不登录 ChatGPT。")
+    click.echo(f"  自定义上游：在主机本地设置 {provider.upper()}_API_KEY。")
+    click.echo("  在桌面“访问密匙”页面创建 Bridge 密匙，再交给客户端使用。")
+    click.echo("  客户端地址：http://127.0.0.1:8765/v1；API Key 必须是有效 Bridge 密匙。")
 
 
 @main.command()
