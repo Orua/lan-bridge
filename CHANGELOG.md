@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.29 — 2026-10-30
+
+- Include the previously uncommitted proxy lane isolation/diagnostics, optional local ASR HTTP/WebSocket gateway, account catalog snapshots, desktop refresh action and test-state isolation in one complete source release.
+- Isolate pass-through model snapshots by credential/account identity and ignore malformed persisted snapshot envelopes. Validate ASR worker health response shape.
+- Keep optional ASR model weights and the independently installed recognition worker outside the desktop package; document its configuration and protocol.
+- Require clean committed product source for release builds, isolate output by version, and publish RELEASE.json with the exact source commit alongside verified package hashes.
+
+## 0.2.28 — 2026-10-30
+
+- Unify Windows desktop installation and startup documentation, add Build/Start/Dev entrypoints, remove obsolete packaged-code patchers and unsupported platform targets, and add a tested Windows release workflow.
+
+## 0.2.27 — 2026-10-21
+
+- Serve an account-scoped model catalog from an atomic persistent snapshot. Check in the background every five minutes; require repeated matching observations before accepting a changed list.
+- Retry missing GPT catalogs and upstream failures three times while retaining the last verified list. Return 503 rather than a partial custom-only catalog when no verified snapshot exists.
+- Reread official login credentials on each attempt and audit catalog changes, timeouts, rate limits, access failures and login refresh requirements without logging credentials.
+- Isolate mocked tests from operator audit and usage storage.
+
+## 0.2.26 — 2026-10-21
+
+- Require an explicitly delivered ASR final result before reporting success. Separate completed, cancelled, invalid-input, worker-failure, recording-idle and correction-timeout outcomes; client cancellations use logical 204 and do not count as server errors.
+- Keep the 120-second correction deadline separate from recording packet idle timeouts. Clean up both relay directions on every terminal outcome.
+- Record audio-specific API names, authenticated key identity, client address, actual recognizer, request IDs, first-text and correction timing in request/audit logs without retaining audio or recognized text.
+- Local test worker preserves the 139-term hotword model and rejects overlapping sessions; the test page isolates callbacks from old sockets when recording again.
+
+## 0.2.25 — 2026-10-21
+
+- Add authenticated `/v1/audio/stream` WebSocket forwarding for 16kHz PCM, incremental text and final utterance correction. Bound frames, recording length and connection lifetime; keep audio and transcripts in memory only.
+- The local demo now supports press-and-hold recording with live text and full-text correction on release, including touch, keyboard and focus-loss handling.
+
+## 0.2.24 — 2026-10-21
+
+- Add authenticated local Chinese transcription at `/v1/audio/transcriptions` and `/v1/audio/status`, with per-model access checks, bounded multipart forwarding, sanitized failures and local-only worker URLs.
+- Optionally start an independently installed local FunASR worker. Keep model weights and PyTorch outside the desktop package. Provide a loopback-only ASR-scoped demo session whose plaintext key stays in memory and is revoked on bridge shutdown.
+
+## 0.2.23 — 2026-10-21
+
+- Isolate official proxy traffic across up to four lazily created connection lanes. A failed VPN handshake retires its lane while preserving other warm clients; sequential reuse and total admission limits remain unchanged.
+- Record connection stages on bounded connect-only retries and return a Chinese proxy/VPN diagnostic for native Responses connection timeouts. No read/write, HTTP or partial-stream replay is added.
+
 ## 0.2.15 — 2026-10-17
 
 - Add an independent Windows Task Scheduler watcher that checks the desktop PID every five seconds and recovers unexpected whole-app exits. Manual stop/quit persists recovery intent; recovery launches stay in the tray and respect the existing login-start preference.

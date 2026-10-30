@@ -10,6 +10,26 @@ from code_cn_bridge.http_utils import send_with_connect_retries
 from tests.test_failure_recovery import call_proxy
 
 
+def test_connection_failure_records_tls_stage_and_preserves_existing_trace(caplog):
+    async def run():
+        observed = []
+        async def original(name, info):
+            observed.append(name)
+        async def handler(request):
+            await request.extensions["trace"]("proxy.start_tls.started", {})
+            raise httpx.ConnectTimeout("fixture")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            req = client.build_request("POST", "https://example.invalid", extensions={"trace": original})
+            with patch('code_cn_bridge.http_utils.anyio.sleep', new_callable=AsyncMock):
+                with pytest.raises(httpx.ConnectTimeout) as caught:
+                    await send_with_connect_retries(client, req)
+            assert caught.value.bridge_connect_stage == "proxy.start_tls"
+            assert req.extensions["trace"] is original
+            assert observed == ["proxy.start_tls.started"] * 3
+            assert "stage=proxy.start_tls" in caplog.text
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize('kind', ['native', 'provider', 'chat'])
 def test_responses_routes_retry_connect_timeout_without_changing_payload(kind):
     class Stream(httpx.AsyncByteStream):

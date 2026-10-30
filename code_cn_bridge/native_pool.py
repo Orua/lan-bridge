@@ -137,7 +137,15 @@ class NativeClientPool:
         if generation != self._generation:
             self.retire()
             self._generation = generation
-        key = (generation, tuple(timeout.as_dict().items()))
+        base_key = (generation, tuple(timeout.as_dict().items()))
+        # VPN handshakes fail independently. Keep up to four lazy lanes so a
+        # failed tunnel retires only its lane, preserving other warm clients.
+        # Sequential requests still use one client; admission bounds all lanes.
+        lane_count = 4 if proxy_url else 1
+        keys = [(*base_key, lane) for lane in range(lane_count)]
+        idle = [key for key in keys if key in self._entries and not self._entries[key].active]
+        unused = [key for key in keys if key not in self._entries]
+        key = (idle or unused or sorted(keys, key=lambda key: self._entries[key].active))[0]
         entry = self._entries.get(key)
         if entry is None:
             entry = _Entry(make_native_async_client(

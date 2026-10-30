@@ -246,6 +246,69 @@ class BrokenTLSProxy(SocketUpstream):
             self.tasks.discard(task)
 
 
+def test_proxy_failure_keeps_other_warm_lane_and_sequential_reuse():
+    async def run():
+        clients = []
+
+        def factory(**kwargs):
+            kwargs.pop("proxy_url")
+            client = make_native_async_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, text="ok")), **kwargs)
+            clients.append(client)
+            return client
+
+        pool = NativeClientPool()
+        timeout = httpx.Timeout(15)
+        def build():
+            client = pool.lease(("https", "chatgpt.com", 443), "http://127.0.0.1:19828", timeout)
+            return client, client.build_request("POST", "https://chatgpt.com/test", headers={"authorization": "fake"}, content=b"unchanged")
+
+        try:
+            with patch("code_cn_bridge.native_pool.make_native_async_client", side_effect=factory):
+                healthy, good_req = build()
+                failing, bad_req = build()
+                good_entry, bad_entry = healthy._entry, failing._entry
+                assert good_entry is not bad_entry
+                with patch.object(bad_entry.client, "send", AsyncMock(side_effect=httpx.ConnectTimeout("fixture"))), pytest.raises(httpx.ConnectTimeout):
+                    await failing.send(bad_req)
+                await failing.aclose()
+                assert bad_entry.client.is_closed
+                assert not good_entry.retired and not good_entry.client.is_closed
+                assert (await healthy.send(good_req)).text == "ok"
+                await healthy.aclose()
+                for _ in range(10):
+                    client, req = build()
+                    assert client._entry is good_entry
+                    assert (await client.send(req)).text == "ok"
+                    await client.aclose()
+                assert len(clients) == 2
+                assert pool.snapshot()["reserved"] == pool.snapshot()["active"] == 0
+        finally:
+            await pool.close()
+    asyncio.run(run())
+
+
+def test_proxy_lane_count_and_total_admission_remain_bounded():
+    async def run():
+        pool = NativeClientPool(max_active=4, max_waiters=4)
+        leases = []
+        try:
+            for _ in range(8):
+                client = pool.lease(("https", "chatgpt.com", 443), "http://127.0.0.1:19828", httpx.Timeout(15))
+                leases.append(client)
+                client.build_request("POST", "https://chatgpt.com/test")
+            assert len(pool._entries) == 4
+            extra = pool.lease(("https", "chatgpt.com", 443), "http://127.0.0.1:19828", httpx.Timeout(15))
+            with pytest.raises(NativePoolBusy):
+                extra.build_request("POST", "https://chatgpt.com/test")
+            await extra.aclose()
+        finally:
+            for client in leases:
+                await client.aclose()
+            await pool.close()
+        assert pool.snapshot()["reserved"] == 0
+    asyncio.run(run())
+
+
 def test_repeated_proxy_tls_failures_retire_slots_and_next_request_recovers():
     async def run():
         async with BrokenTLSProxy() as proxy:

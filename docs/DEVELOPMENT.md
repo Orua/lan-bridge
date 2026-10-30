@@ -25,10 +25,11 @@ Build 创建 `.venv`，安装 Python 与 npm 依赖，检查版本，执行 Pyth
 输出均相对仓库目录，不依赖开发者用户名或仓库存放层级：
 
 ```text
-agent/output/windows/
+agent/output/windows/<VERSION>/
   LAN BRIDGE Setup <VERSION>.exe    # 推荐对外安装包
   LAN BRIDGE <VERSION>.exe          # 同一个桌面的便携形式
   SHA256SUMS.txt                    # 安装包、便携包及 unpacked 核心文件哈希
+  RELEASE.json                     # 版本、准确源提交号、构建时间与平台
   win-unpacked/
     LAN BRIDGE.exe
     resources/backend/lan-bridge.exe
@@ -65,13 +66,16 @@ python scripts/version.py --check
 ```
 
 修改已有文件前按 AGENTS.md 备份。只提交本任务改动，不能夹带其他未提交功能。
-从待发布提交的干净工作树运行完整 Build 后才能发布，避免把本机脏工作区打包给用户。
+从待发布提交的干净工作树运行完整 Build 后才能发布。脚本拒绝未提交或未跟踪的产品文件（agent 内记录除外），并在构建结束再检查一次。
+检查全部待交付功能与新模块、依赖和测试，不能静默排除本机已实现功能后把旧子集当作“最新完整版”。
+输出按版本隔离，RELEASE.json 记录准确源提交号；推送代码、发布下载包、部署本机运行目录分别记录结果。
+发布包必须来自同一个提交，远端 tag 必须指向该提交，远端文件哈希必须与本地验证值相符。更换源码必须升级版本，不覆盖旧版本二进制。
 完整测试通过也不能代替目标用户电脑上的登录与实际调用验收。
 
 GitHub Actions **Windows desktop release** 支持两种方式：
 
 - 手动 Run workflow：构建、测试并提供下载 artifact，不创建公开 Release。
-- 推送与 VERSION 相同的 `vX.Y.Z` tag：同样构建验证后发布 Setup、便携包与 SHA256SUMS。
+- 推送与 VERSION 相同的 `vX.Y.Z` tag：同样构建验证后发布 Setup、便携包、SHA256SUMS 与 RELEASE.json。
 
 CI 使用 Python 3.12、Node 22；发布流程不会部署或停止维护者本机服务。
 本机生成的校验文件也可用来复核发布文件：`Get-FileHash -Algorithm SHA256 <安装包路径>`。

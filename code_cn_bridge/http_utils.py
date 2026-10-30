@@ -19,18 +19,38 @@ async def send_with_connect_retries(
     client: httpx.AsyncClient, request: httpx.Request, *, stream: bool = False,
 ) -> httpx.Response:
     """Retry connection setup only; never replay a request after writes/reads."""
-    for attempt in range(3):
-        try:
-            return await client.send(request, stream=stream)
-        except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
-            if attempt == 2:
-                raise
-            delay = 0.5 * (2 ** attempt)
-            logger.warning(
-                "Upstream connection retry=%d/2 delay=%.1fs host=%s error=%s",
-                attempt + 1, delay, request.url.host, type(exc).__name__,
-            )
-            await anyio.sleep(delay)
+    previous_trace = request.extensions.get("trace")
+    stage = "connection_setup"
+
+    async def trace(name, info):
+        nonlocal stage
+        if name.endswith(".started"):
+            stage = name.removesuffix(".started")
+        if previous_trace is not None:
+            await previous_trace(name, info)
+
+    request.extensions["trace"] = trace
+    try:
+        for attempt in range(3):
+            stage = "connection_setup"
+            try:
+                return await client.send(request, stream=stream)
+            except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                exc.bridge_connect_stage = stage
+                if attempt == 2:
+                    logger.warning("Upstream connection exhausted host=%s stage=%s error=%s", request.url.host, stage, type(exc).__name__)
+                    raise
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    "Upstream connection retry=%d/2 delay=%.1fs host=%s stage=%s error=%s",
+                    attempt + 1, delay, request.url.host, stage, type(exc).__name__,
+                )
+                await anyio.sleep(delay)
+    finally:
+        if previous_trace is None:
+            request.extensions.pop("trace", None)
+        else:
+            request.extensions["trace"] = previous_trace
     raise AssertionError("unreachable")
 
 

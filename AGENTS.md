@@ -41,6 +41,14 @@ same version.
 
 ## Release checks
 
+Every release/deployment must include all intended product changes, including new untracked modules and their dependencies/tests. Review the remaining Git diff explicitly; do not silently publish an older committed subset as the latest complete product. Resolve or report unfinished features before release.
+
+Use `scripts/windows.ps1 -Action Build` from the final committed source. It rejects dirty product files, writes version-isolated output under `agent/output/windows/<VERSION>/`, and records the exact source commit in `RELEASE.json`. Agent notes/backups/temp/output are not product source.
+
+Publish only the current version's Setup, portable, checksums and source manifest. Confirm the published asset hashes match the verified local files and the release tag points to the manifest's source commit. Never replace an existing version's binaries with different source; increment VERSION for a new complete release.
+
+Before local runtime deployment, back up the fixed runtime to G:, deploy this same verified unpacked release, then use one direct status check to confirm the running version. Report separately whether source push, release publication and local runtime deployment actually happened; do not imply one proves the others.
+
 Before deployment, run the Python tests, desktop typecheck/build/tests, build
 the backend, and package Electron. Verify the staged executable names, hashes,
 embedded CSP, and displayed version. Back up the current fixed runtime to `G:`

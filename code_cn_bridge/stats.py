@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -41,6 +41,7 @@ class RequestLog:
     first_response_ms: float | None = None
     access_key_id: str = ""
     access_key_prefix: str = ""
+    details: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -62,6 +63,7 @@ class RequestLog:
             "first_response_ms": round(self.first_response_ms, 1) if self.first_response_ms is not None else None,
             "access_key_id": self.access_key_id,
             "access_key_prefix": self.access_key_prefix,
+            "details": self.details,
         }
 
 
@@ -108,6 +110,7 @@ class UsageStore:
             "elapsed_ms": round(log.elapsed_ms, 1),
             "first_response_ms": round(log.first_response_ms, 1) if log.first_response_ms is not None else None,
             "error": bool(log.error),
+            "details": log.details,
         }
         line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
         path = self.usage_dir / f"access-{day}.jsonl"

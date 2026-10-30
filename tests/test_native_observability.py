@@ -122,8 +122,7 @@ def test_old_downstream_cannot_hide_new_account_models():
         return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol"}]})
 
     async def run():
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        with patch("code_cn_bridge.native_proxy._native_client", return_value=client), patch("code_cn_bridge.native_proxy.native_request_headers", return_value={}), patch("code_cn_bridge.native_proxy._host_catalog_client_version", return_value="0.162.0"):
+        with patch("code_cn_bridge.native_proxy._native_client", side_effect=lambda *args: httpx.AsyncClient(transport=httpx.MockTransport(handler))), patch("code_cn_bridge.native_proxy.native_request_headers", return_value={}), patch("code_cn_bridge.native_proxy._host_catalog_client_version", return_value="0.162.0"):
             return await fetch_merged_models(request(b'client_version=0.149.1&refresh=1'), config())
 
     response = asyncio.run(run())
@@ -131,4 +130,4 @@ def test_old_downstream_cannot_hide_new_account_models():
     assert observed[0]["client_version"] == "0.162.0"
     assert "refresh" not in observed[0]
     assert payload["data"][0]["id"] == "gpt-6.1-sol"
-    assert payload["native_catalog"]["source"] == "account"
+    assert payload["native_catalog"]["source"] == "snapshot"

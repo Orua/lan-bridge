@@ -105,7 +105,10 @@ class BridgeAccessMiddleware(BaseHTTPMiddleware):
             from .config import get_config
 
             try:
-                principal = authenticate_bridge_headers(request.headers, get_config())
+                asr = getattr(request.app.state, "local_asr", None)
+                principal = asr.authenticate_demo(request.headers, request.url.path) if asr else None
+                if principal is None:
+                    principal = authenticate_bridge_headers(request.headers, get_config())
             except BridgeAccessError as exc:
                 status_code = exc.status_code
                 error_type = (

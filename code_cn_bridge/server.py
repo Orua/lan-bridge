@@ -32,6 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import __version__
+from .local_asr import LocalASRService, create_asr_router
 from .generated_images import generated_image_path, render_generated_image
 from .config import get_config, reload_config, reload_config_if_changed
 from .adapters import get_registry
@@ -3698,6 +3699,7 @@ def _reload_runtime_config():
 
 def create_app(verbose: bool = False) -> FastAPI:
     cfg = get_config()
+    local_asr = LocalASRService(get_config)
     configured_debug = str(cfg._data.get("server", {}).get("log_level", "")).lower() == "debug"
     _setup_logging(verbose or configured_debug)
 
@@ -3739,6 +3741,10 @@ def create_app(verbose: bool = False) -> FastAPI:
         )
         cfg._native_http_pool = native_pool
         try:
+            await local_asr.ensure_started()
+        except Exception:
+            logger.exception("本机语音服务启动失败，模型桥接服务继续运行")
+        try:
             yield
         finally:
             watcher.cancel()
@@ -3747,6 +3753,9 @@ def create_app(verbose: bool = False) -> FastAPI:
             except asyncio.CancelledError:
                 pass
             await close_upstream_clients()
+            from .catalog_store import close_catalog_tasks
+            await close_catalog_tasks()
+            await local_asr.close()
             await native_pool.close()
             if getattr(cfg, "_native_http_pool", None) is native_pool:
                 del cfg._native_http_pool
@@ -3763,6 +3772,7 @@ def create_app(verbose: bool = False) -> FastAPI:
     )
 
     app.add_middleware(ErrorHandlingMiddleware)
+    app.state.local_asr = local_asr
     app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(BridgeAccessMiddleware)
     app.add_middleware(
@@ -3775,6 +3785,7 @@ def create_app(verbose: bool = False) -> FastAPI:
 
     # 注册管理 API 路由
     app.include_router(admin_router)
+    app.include_router(create_asr_router(local_asr, _require_local_admin, _record_request, _audit_event))
 
     # ── 路由 ─────────────────────────────────────────────────────
 
@@ -4133,6 +4144,9 @@ def create_app(verbose: bool = False) -> FastAPI:
                 )
             except httpx.TransportError as exc:
                 error_msg = str(exc) or type(exc).__name__
+                if isinstance(exc, httpx.ConnectTimeout):
+                    stage = getattr(exc, "bridge_connect_stage", "connection_setup")
+                    error_msg = f"官方上游连接超时（ConnectTimeout，阶段：{stage}），已尝试 3 次。请检查桥接主机的代理/VPN 线路后重试。"
                 logger.warning("Native upstream transport failure type=%s request_id=%s", type(exc).__name__, request_id)
                 _audit_event("responses.native_failed", request_id, model=model, error=error_msg, error_type=type(exc).__name__)
                 _record_request(start_time, model, "responses", 502, stream, error_msg,
@@ -6975,6 +6989,7 @@ def _record_request(
     first_response_ms: float | None = None,
     client_ip: str | None = None,
     upstream_api: str = "",
+    details: dict | None = None,
 ):
     if _suppress_request_stats.get():
         return
@@ -7014,6 +7029,7 @@ def _record_request(
         first_response_ms=first_response_ms,
         access_key_id=principal.key_id,
         access_key_prefix=principal.prefix,
+        details=details or {},
     ))
 
 def _record_and_respond(

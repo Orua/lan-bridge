@@ -501,7 +501,7 @@ class UnifiedRoutingTests(unittest.TestCase):
 
         def handler(request: httpx.Request) -> httpx.Response:
             observed["client_version"] = request.url.params.get("client_version", "")
-            return httpx.Response(200, json={"models": []})
+            return httpx.Response(200, json={"models": [{"slug": "gpt-6.1-sol"}]})
 
         request = Request({
             "type": "http",
@@ -514,9 +514,8 @@ class UnifiedRoutingTests(unittest.TestCase):
             "client": ("127.0.0.1", 12345),
             "server": ("127.0.0.1", 8765),
         })
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-        with patch("code_cn_bridge.native_proxy._host_catalog_client_version", return_value="0.162.0"), patch("code_cn_bridge.native_proxy._native_client", return_value=client):
+        with patch("code_cn_bridge.native_proxy._host_catalog_client_version", return_value="0.162.0"), patch("code_cn_bridge.native_proxy._native_client", side_effect=lambda *args: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
             response = asyncio.run(fetch_merged_models(request, FakeConfig()))
 
         self.assertEqual(response.status_code, 200)
@@ -542,9 +541,8 @@ class UnifiedRoutingTests(unittest.TestCase):
             "client": ("127.0.0.1", 12345),
             "server": ("127.0.0.1", 8765),
         })
-        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
-        with patch("code_cn_bridge.native_proxy._native_client", return_value=client):
+        with patch("code_cn_bridge.native_proxy._native_client", side_effect=lambda *args: httpx.AsyncClient(transport=httpx.MockTransport(handler))):
             response = asyncio.run(fetch_merged_models(request, FakeConfig()))
 
         payload = json.loads(response.body)

@@ -9,7 +9,13 @@ async function main() {
   const asar = await import('@electron/asar');
   const root = path.resolve(__dirname, '../..');
   const version = fs.readFileSync(path.join(root, 'VERSION'), 'utf8').trim();
-  const output = path.resolve(process.argv[2] || path.join(root, 'agent/output/windows'));
+  const output = path.resolve(process.argv[2] || path.join(root, 'agent/output/windows', version));
+  const manifestPath = path.join(output, 'RELEASE.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const sourceCommit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).trim();
+  if (manifest.version !== version || manifest.sourceCommit !== sourceCommit || manifest.sourceClean !== true) {
+    throw new Error('Release source manifest does not match this checkout. Rebuild from the committed source.');
+  }
   const appDir = path.join(output, 'win-unpacked');
   const desktop = path.join(appDir, 'LAN BRIDGE.exe');
   const backend = verifyPackagedBackend(appDir, 'win32');
@@ -26,7 +32,7 @@ async function main() {
   if (!jsAssets.some(name => asar.extractFile(archive, name.replace(/^[/\\]/, '')).includes(Buffer.from(version)))) {
     throw new Error('UI version is missing from the packaged JavaScript.');
   }
-  const files = [desktop, backend, archive];
+  const files = [desktop, backend, archive, manifestPath];
   for (const name of [`LAN BRIDGE Setup ${version}.exe`, `LAN BRIDGE ${version}.exe`]) {
     const file = path.join(output, name);
     if (!fs.existsSync(file)) throw new Error(`Release asset missing: ${name}`);

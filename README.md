@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Start
 ```
 
 `Build` 自动创建本项目的 `.venv`、安装依赖、执行测试、打包后端与 Electron，并检查版本、CSP 和 SHA-256。
-安装包在 **`agent/output/windows/`**。`Start` 打开其中的完整桌面程序；首次构建需要联网下载依赖。
+安装包在 **`agent/output/windows/<版本>/`**。`Start` 打开当前版本的完整桌面程序；首次构建需要联网下载依赖，正式 Build 要求产品源码已全部提交。
 完整开发命令与发布约束见 [开发与发布指南](docs/DEVELOPMENT.md)。
 
 ## 安全与数据位置
@@ -56,6 +56,8 @@ powershell -ExecutionPolicy Bypass -File scripts/windows.ps1 -Action Start
 - 不要提交真实 YAML、`.env`、`auth.json`、访问密匙或日志。导出的脱敏配置不包含可迁移的登录凭据。
 
 ## 版本与来源
+
+可选语音转写网关的依赖和接口见 [本机语音转写](docs/LOCAL_ASR.md)。识别引擎与模型需独立安装，不包含在桌面包中。
 
 `VERSION` 是唯一发布版本来源。桌面、后端、CLI 与“关于”页必须保持一致。
 目前维护 Windows x64 桌面发布，不提供独立网页产品或独立 CLI 安装包。

@@ -639,7 +639,7 @@ async def test_connection(alias: str, data: dict | None = None):
         responses_body = {
             "model": target,
             "input": "Reply only OK",
-            "max_output_tokens": 8,
+            "max_output_tokens": 256,
             "stream": test_mode == "stream",
             "store": False,
         }

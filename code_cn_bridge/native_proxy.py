@@ -1080,71 +1080,78 @@ def merge_model_catalog(native_payload: dict[str, Any], config) -> dict[str, Any
 
 
 async def fetch_merged_models(request: Request, config) -> Response:
-    client = _native_client(config, httpx.Timeout(5.0, connect=2.0))
+    from .catalog_store import CatalogSnapshot, account_scope
     url = f"{_native_base_url(config)}/models"
     host_version = await asyncio.to_thread(_host_catalog_client_version, config)
     requested_version = request.query_params.get("client_version", "")
     catalog_version = ".".join(map(str, max(_version_tuple(host_version), _version_tuple(requested_version))))
     query = [(name, value) for name, value in request.query_params.multi_items() if name not in {"client_version", "refresh"}]
     query.append(("client_version", catalog_version))
-    try:
-        cache_key = (url, tuple(query))
-        cached = getattr(config, "_native_catalog_cache", None)
-        cached = cached if cached and cached[0] == cache_key else None
-        cached_age = time.monotonic() - cached[1] if cached else float("inf")
-        from_cache = bool(cached and cached_age < 60 and request.query_params.get("refresh") != "1")
-        if from_cache:
-            upstream = httpx.Response(200, json=cached[2])
-        else:
-            try:
-                upstream = await client.get(url, params=query, headers=native_request_headers(request.headers, config))
-            except (httpx.HTTPError, NativeAuthError):
-                from_cache = bool(cached and cached_age < 300)
-                upstream = httpx.Response(200, json=cached[2]) if from_cache else httpx.Response(503)
-        if upstream.is_success:
-            native_payload = upstream.json()
-            if not from_cache:
-                config._native_catalog_cache = (cache_key, time.monotonic(), native_payload)
-            merged = merge_model_catalog(native_payload, config)
-            merged["native_catalog"] = {"source": "account", "client_version": catalog_version, "available": True}
-            headers = _response_headers(upstream.headers)
-            headers.pop("content-type", None)
-            return Response(
-                content=json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
-                status_code=200,
-                headers=headers,
-                media_type="application/json",
-            )
-        custom_aliases = {
-            str(alias)
-            for alias, entry in getattr(config, "model_mapping", {}).items()
-            if isinstance(entry, dict) and entry.get("enabled", True)
-        }
-        if custom_aliases:
-            # WorkBuddy and ordinary OpenAI clients still need the configured
-            # custom aliases when the optional native catalog is unavailable.
-            # Do not invent native entries in this fallback; those require the
-            # host's native login and remain absent until the catalog is live.
-            fallback = merge_model_catalog({"models": []}, config)
-            fallback["models"] = [
-                model for model in fallback.get("models", [])
-                if str(model.get("slug") or "") in custom_aliases
-            ]
-            fallback = add_openai_model_list(fallback)
-            fallback["native_catalog"] = {"source": "configured", "client_version": catalog_version, "available": False, "upstream_status": upstream.status_code}
-            headers = _response_headers(upstream.headers)
-            headers.pop("content-type", None)
-            return Response(
-                content=json.dumps(fallback, ensure_ascii=False, separators=(",", ":")),
-                status_code=200,
-                headers=headers,
-                media_type="application/json",
-            )
-        return Response(
-            content=upstream.content,
-            status_code=upstream.status_code,
-            headers=_response_headers(upstream.headers),
-            media_type=None,
-        )
-    finally:
-        await client.aclose()
+    scope = account_scope(config, url, query, request.headers)
+    snapshots = getattr(config, "_catalog_snapshots", None)
+    if snapshots is None:
+        snapshots = config._catalog_snapshots = {}
+    if scope not in snapshots:
+        snapshots[scope] = CatalogSnapshot(scope)
+    snapshot = snapshots[scope]
+
+    def emit(event, **fields):
+        from .server import _audit_event
+        _audit_event(event, "catalog-" + scope[:12], client_version=catalog_version, **fields)
+
+    async def fetch():
+        client = None
+        try:
+            # Credentials are reread on every attempt, including after 401/403.
+            # Official Codex owns OAuth refresh; never race its refresh token.
+            headers = native_request_headers(request.headers, config)
+            # Pool leases are single-request objects. Each confirmation/retry
+            # needs its own lease, while the underlying pool keeps connections.
+            client = _native_client(config, httpx.Timeout(5.0, connect=2.0))
+            upstream = await client.get(url, params=query, headers=headers)
+            if upstream.is_success:
+                try:
+                    payload = upstream.json()
+                except ValueError:
+                    return None, upstream.status_code, "catalog_invalid_json"
+                return payload, upstream.status_code, ""
+            code = ("login_refresh_required" if upstream.status_code == 401 else
+                    "account_access_denied" if upstream.status_code == 403 else
+                    "catalog_rate_limited" if upstream.status_code == 429 else "catalog_upstream_error")
+            if upstream.status_code in {401, 403}:
+                emit("catalog.auth_checked", upstream_status=upstream.status_code, reason=code,
+                     action="reread_host_credentials_on_retry")
+            return None, upstream.status_code, code
+        except NativeAuthError:
+            emit("catalog.auth_checked", reason="login_refresh_required", action="host_login_refresh_required")
+            return None, 401, "login_refresh_required"
+        except httpx.TimeoutException:
+            return None, 503, "catalog_timeout"
+        except httpx.HTTPError:
+            return None, 503, "catalog_network_error"
+        finally:
+            if client is not None:
+                await client.aclose()
+
+    force = request.query_params.get("refresh") == "1"
+    if not snapshot.payload or force:
+        snapshot.start_refresh(fetch, emit)
+        await asyncio.shield(snapshot.task)
+    elif time.monotonic() >= snapshot.next_check:
+        # The user-facing list is a stable snapshot; network checks run separately.
+        snapshot.start_refresh(fetch, emit)
+    if snapshot.payload:
+        merged = add_openai_model_list(merge_model_catalog(snapshot.payload, config))
+        merged["native_catalog"] = {"source": "snapshot", "client_version": catalog_version,
+            "available": True, "stale": bool(snapshot.error_code), "checked_at": snapshot.checked_at,
+            "refresh_status": "failed" if snapshot.error_code else "ok", "error_code": snapshot.error_code,
+            "upstream_status": snapshot.upstream_status}
+        return Response(json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
+                        media_type="application/json", headers={"Cache-Control": "no-store"})
+    # A partial 200 list would make downstream clients delete all GPT choices.
+    return Response(json.dumps({"error": {"type": "model_catalog_error", "code": snapshot.error_code,
+                         "message": "模型目录尚未验证成功，请稍后重试；请保留原模型选择。"},
+                     "native_catalog": {"source": "unavailable", "available": False,
+                                        "upstream_status": snapshot.upstream_status,
+                                        "error_code": snapshot.error_code}}, ensure_ascii=False),
+                    status_code=503, media_type="application/json")
