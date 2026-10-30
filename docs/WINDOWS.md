@@ -5,6 +5,8 @@
 支持 Windows 10/11 x64。
 打开 [Releases 最新版](https://github.com/Orua/lan-bridge/releases/latest)，下载 `LAN BRIDGE Setup <版本>.exe` 并安装。
 开始菜单和桌面快捷方式都叫 **LAN BRIDGE**。
+GitHub 会把文件名里的空格改成点号，因此下载页实际显示为 `LAN.BRIDGE.Setup.<版本>.exe`；便携包为 `LAN.BRIDGE.<版本>.exe`。
+SHA256SUMS 中保留本机构建的空格形式文件名，校验时用 `Get-FileHash -Algorithm SHA256 <下载文件路径>` 对比对应哈希即可，重命名不影响哈希。
 只运行桌面版不需要 Python 或 Node.js。只有需要进行 Codex 登录时，才另外安装官方 Codex CLI。
 
 `LAN BRIDGE <版本>.exe` 是同一个桌面版的便携包，和 Setup 二选一；它会使用临时解压目录，日常固定使用建议选 Setup。
