@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.31 — 2026-10-30
+
+- Run CI tests through Python so repository-local test and version-script imports resolve on clean Windows runners, matching the verified desktop build entrypoint.
+
+
 ## 0.2.30 — 2026-10-30
 
 - Add authenticated POST /v1 (and /v1/) protocol dispatch and /v1/chat shorthand; preserve existing Chat, Responses and WebSocket endpoints.
