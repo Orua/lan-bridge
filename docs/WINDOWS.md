@@ -99,6 +99,20 @@ requires_openai_auth = false
 把示例 IP 改成真实主机地址。在客户端设置 `LAN_BRIDGE_API_KEY` 为 Bridge 密匙，并重新打开客户端使环境变量生效。
 普通 Chat 客户端应选择 OpenAI-compatible / Chat Completions，使用配置为支持该协议的模型别名。
 
+接入地址同时兼容完整路径和简写路径：
+
+| 客户端的地址字段 | 推荐填写 | 说明 |
+| --- | --- | --- |
+| Base URL（自动补全 API 路径） | `http://<桥接IP>:8765/v1` | SDK 自动补全 `/chat/completions` 或 `/responses` |
+| 完整接口地址（例如 WorkBuddy） | `http://<桥接IP>:8765/v1` | POST 请求有 `messages` 时使用 Chat，有 `input` 时使用 Responses |
+| 明确使用 Chat | `http://<桥接IP>:8765/v1/chat` | 与原 `/v1/chat/completions` 相同，返回 Chat 格式 |
+| 明确使用 Responses | `http://<桥接IP>:8765/v1/responses` | 返回 Responses 格式，原 HTTP/WebSocket 路径保留 |
+
+旧 `/v1/chat/completions` 地址继续有效，无需修改已有客户端。
+统一入口也接受 `/v1/`，请求必须且只能包含 `messages` 或 `input` 之一；不会根据模型名猜测协议。
+所有入口都需要同一套 Bridge 访问密匙，并沿用原有模型权限、流式响应和上游路由。
+
+
 仪表盘的“切换到统一/自定义路由”会修改桥接电脑上 Codex 的路由配置；启动桌面本身不需要点击它。
 只希望为另一台设备提供服务时，先保持主机 Codex 官方登录配置。
 “恢复官方直连”用于让主机 Codex 恢复官方路由，不负责创建登录缓存。

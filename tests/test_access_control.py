@@ -149,6 +149,9 @@ def test_all_openai_compatible_http_endpoints_require_a_key(tmp_path):
     _created_key(config)
     endpoints = (
         ("get", "/v1/models", None),
+        ("post", "/v1", {"model": "deepseek-v4-pro", "messages": []}),
+        ("post", "/v1/", {"model": "gpt-5.6-sol", "input": []}),
+        ("post", "/v1/chat", {"model": "deepseek-v4-pro", "messages": []}),
         ("post", "/v1/responses", {"model": "gpt-5.6-sol", "input": []}),
         ("post", "/v1/responses/compact", {"model": "gpt-5.6-sol", "input": []}),
         ("post", "/v1/chat/completions", {"model": "deepseek-v4-pro", "messages": []}),

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.30 — 2026-10-30
+
+- Add authenticated POST /v1 (and /v1/) protocol dispatch and /v1/chat shorthand; preserve existing Chat, Responses and WebSocket endpoints.
+- Support per-model minimum output budgets and reasoning effort aliases for WorkBuddy probes and auxiliary requests to OpenAI API models.
+
+
 ## 0.2.29 — 2026-10-30
 
 - Include the previously uncommitted proxy lane isolation/diagnostics, optional local ASR HTTP/WebSocket gateway, account catalog snapshots, desktop refresh action and test-state isolation in one complete source release.

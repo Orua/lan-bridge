@@ -255,8 +255,18 @@ def convert_chat_request_to_responses(
     elif body.get("max_tokens") is not None:
         payload["max_output_tokens"] = body["max_tokens"]
 
+    # Some clients probe with one token; honor the upstream model's minimum.
+    minimum = capabilities.get("min_output_tokens")
+    limit = payload.get("max_output_tokens")
+    if (isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0
+            and isinstance(limit, int) and not isinstance(limit, bool) and limit > 0):
+        payload["max_output_tokens"] = max(minimum, limit)
+
     if body.get("reasoning_effort") is not None:
         effort = str(body["reasoning_effort"]).strip().lower()
+        aliases = capabilities.get("reasoning_effort_aliases")
+        if isinstance(aliases, dict):
+            effort = str(aliases.get(effort, effort)).strip().lower()
         if capabilities.get("reasoning") is False:
             raise ChatToResponsesConversionError("当前 Responses 模型未启用 reasoning 能力")
         supported = _supported_reasoning_efforts(capabilities)

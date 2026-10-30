@@ -4801,6 +4801,7 @@ def create_app(verbose: bool = False) -> FastAPI:
         except WebSocketDisconnect:
             return
 
+    @app.post("/v1/chat", include_in_schema=False)
     @app.post("/v1/chat/completions")
     async def chat_completions_endpoint(request: Request):
         """Serve Chat clients through either Chat or explicitly resolved Responses routes."""
@@ -5250,6 +5251,29 @@ def create_app(verbose: bool = False) -> FastAPI:
                 content=build_error_response(str(exc)),
                 status_code=500,
             )
+    @app.post("/v1/", include_in_schema=False)
+    @app.post("/v1")
+    async def inference_endpoint(request: Request):
+        """Accept a complete Chat or Responses request at the shared base URL."""
+        try:
+            body = await _read_json_body(request, uuid.uuid4().hex[:12], "inference")
+        except ValueError:
+            return JSONResponse(
+                content=build_error_response("Invalid JSON request body", "invalid_request_error", 400),
+                status_code=400,
+            )
+        has_messages, has_input = "messages" in body, "input" in body
+        if has_messages == has_input:
+            return JSONResponse(
+                content=build_error_response(
+                    "Use messages for Chat or input for Responses; provide exactly one of them.",
+                    "invalid_request_error", 400),
+                status_code=400,
+            )
+        if has_messages:
+            return await chat_completions_endpoint(request)
+        return await responses_endpoint(request)
+
     @app.post("/v1/images/generations")
     async def images_generations(request: Request):
         """图片生成端点: 接受 DALL-E 格式请求，路由到配置的生图模型"""

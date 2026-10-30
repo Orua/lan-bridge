@@ -99,6 +99,34 @@ class WorkBuddyResponsesBridgeTests(unittest.TestCase):
         self.auth_patch.start()
         self.addCleanup(self.auth_patch.stop)
 
+    def test_workbuddy_reasoning_aliases_use_supported_upstream_effort(self):
+        entry = {"capabilities": {"reasoning_effort_aliases": {"none": "low", "minimal": "low"},
+                                  "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]}}
+        for requested, expected in [("none", "low"), ("minimal", "low"), ("high", "high"), ("max", "max")]:
+            with self.subTest(effort=requested):
+                body = {"messages": [{"role": "user", "content": "hello"}], "reasoning_effort": requested}
+                result = convert_chat_request_to_responses(body, "gpt-6.1-sol", model_entry=entry)
+                self.assertEqual(result["reasoning"], {"effort": expected})
+                self.assertEqual(body["reasoning_effort"], requested)
+        with self.assertRaises(ChatToResponsesConversionError):
+            convert_chat_request_to_responses(
+                {"messages": [{"role": "user", "content": "x"}], "reasoning_effort": "invalid"},
+                "gpt-6.1-sol", model_entry=entry)
+
+    def test_workbuddy_probe_honors_configured_upstream_minimum(self):
+        for field, requested, expected in [("max_tokens", 1, 16), ("max_tokens", 8, 16),
+                                           ("max_tokens", 256, 256), ("max_completion_tokens", 1, 16)]:
+            with self.subTest(field=field, requested=requested):
+                body = {"messages": [{"role": "user", "content": "Reply with OK."}],
+                        "stream": True, field: requested}
+                converted = convert_chat_request_to_responses(
+                    body, "gpt-6.1-sol", model_entry={"capabilities": {"min_output_tokens": 16}})
+                self.assertEqual(converted["max_output_tokens"], expected)
+                self.assertEqual(body[field], requested)
+        unchanged = convert_chat_request_to_responses(
+            {"messages": [{"role": "user", "content": "x"}], "max_tokens": 1}, "other")
+        self.assertEqual(unchanged["max_output_tokens"], 1)
+
     def test_request_conversion_preserves_roles_images_tools_and_limits(self):
         request = convert_chat_request_to_responses(
             {

@@ -101,7 +101,7 @@ class BridgeAccessMiddleware(BaseHTTPMiddleware):
     """Authenticate every OpenAI-compatible endpoint with a managed bridge key."""
 
     async def dispatch(self, request: Request, call_next):
-        if request.method != "OPTIONS" and request.url.path.startswith("/v1/"):
+        if request.method != "OPTIONS" and (request.url.path == "/v1" or request.url.path.startswith("/v1/")):
             from .config import get_config
 
             try:

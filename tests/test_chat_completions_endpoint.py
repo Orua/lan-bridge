@@ -3,7 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -172,6 +172,41 @@ class ChatCompletionsEndpointTests(unittest.TestCase):
         self.assertEqual(categories["current_user"]["items"], 1)
         self.assertEqual(categories["tool_outputs"]["items"], 1)
         self.assertEqual(distribution["tools"]["mcp"], 1)
+
+    def test_chat_shortcuts_preserve_chat_response_and_streaming(self):
+        adapter, upstream = _FakeAdapter(), _FakeClient()
+        with (
+            patch.object(server, "get_config", return_value=_FakeConfig()),
+            patch.object(server, "_get_adapter_for_model", return_value=(adapter, "fake", "upstream-model", "key")),
+            patch.object(server, "get_upstream_client", return_value=upstream),
+        ):
+            client = TestClient(server.create_app())
+            for path in ("/v1/chat/completions", "/v1/chat", "/v1", "/v1/"):
+                for stream in (False, True):
+                    with self.subTest(path=path, stream=stream):
+                        response = client.post(path, json={"model": "workbuddy-model",
+                            "messages": [{"role": "user", "content": "hello"}], "stream": stream})
+                        self.assertEqual(response.status_code, 200)
+                        if stream:
+                            self.assertIn("data: [DONE]", response.text)
+                        else:
+                            self.assertEqual(response.json()["object"], "chat.completion")
+
+    def test_shared_endpoint_dispatches_responses_and_rejects_ambiguous_input(self):
+        from fastapi.responses import JSONResponse
+        cfg = _FakeConfig()
+        cfg.native_models = {"native-model": {"enabled": True}}
+        native = AsyncMock(return_value=JSONResponse({"id": "resp_test", "object": "response", "output": []}))
+        with patch.object(server, "get_config", return_value=cfg), patch.object(server, "proxy_native_responses", native):
+            client = TestClient(server.create_app())
+            for path in ("/v1/responses", "/v1", "/v1/"):
+                response = client.post(path, json={"model": "native-model", "input": "hello", "stream": False})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["object"], "response")
+            self.assertEqual(native.await_count, 3)
+            for payload in ({"model": "x"}, {"messages": [], "input": []}, ["not an object"]):
+                self.assertEqual(client.post("/v1", json=payload).status_code, 400)
+            self.assertEqual(client.post("/v1", content="invalid").status_code, 400)
 
     def test_chat_endpoint_forwards_chat_request_without_responses_translation(self):
         adapter = _FakeAdapter()
